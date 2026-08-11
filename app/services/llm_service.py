@@ -3,6 +3,7 @@ from app.config import get_settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.context.examples import format_examples
 from app.constants import MODELS_PRICING
+from app.services.evaluation import evaluate_estimation_structure
 
 settings = get_settings()
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -34,8 +35,11 @@ def generate_estimation(transcription: str) -> dict:
         ]
     )
 
+    estimation_text = response.choices[0].message.content
+    finish_reason = response.choices[0].finish_reason or "stop"
+
     return {
-        "estimation": response.choices[0].message.content,
+        "estimation": estimation_text,
         "model": settings.LLM_MODEL,
         "provider": settings.LLM_PROVIDER,
         "tokens_used": response.usage.prompt_tokens + response.usage.completion_tokens,
@@ -44,4 +48,5 @@ def generate_estimation(transcription: str) -> dict:
             response.usage.prompt_tokens,
             response.usage.completion_tokens
         ),
+        "evaluation": evaluate_estimation_structure(estimation_text, finish_reason),
     }

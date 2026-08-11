@@ -5,6 +5,7 @@
 ![CAG](https://img.shields.io/badge/architecture-CAG-purple)
 ![Version](https://img.shields.io/badge/version-0.1.0-lightgrey)
 ![uv](https://img.shields.io/badge/package%20manager-uv-de5fe9)
+![Docker](https://img.shields.io/badge/docker-ready-2496ED)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 API for software project estimation using LLMs, based on a CAG (Context-Augmented Generation) architecture: historical estimation examples are injected into the prompt to guide the model toward more accurate and consistent budgets.
@@ -19,7 +20,8 @@ cag-estimator/
 │   ├── routers/            -- Endpoint handlers
 │   │   └── estimations.py
 │   ├── services/           -- LLM calls and business logic
-│   │   └── llm_service.py
+│   │   ├── llm_service.py
+│   │   └── evaluation.py
 │   ├── context/            -- CAG reference data
 │   │   └── examples.py
 │   └── schemas/            -- Request/response schemas
@@ -49,6 +51,11 @@ uv run uvicorn app.main:app --reload
 
 The API will be available at `http://127.0.0.1:8000`. Interactive docs at `/docs`.
 
+### Running with Docker
+```bash
+docker compose up --build
+```
+
 ## Environment Variables
 See [`.env.example`](.env.example) for the full list of variables and their possible values.
 
@@ -75,6 +82,17 @@ See [`.env.example`](.env.example) for the full list of variables and their poss
   "model": "gpt-4o-mini",
   "provider": "openai",
   "tokens_used": 1234,
-  "estimated_cost": 0.0021
+  "estimated_cost": 0.0021,
+  "evaluation": {
+    "score": 1.0,
+    "issues": []
+  }
 }
+```
+
+## Testing an Estimation
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/estimate \
+  -H "Content-Type: application/json" \
+  -d '{"transcription": "Client meeting summary describing the project..."}'
 ```

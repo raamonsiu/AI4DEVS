@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from scalar_fastapi import get_scalar_api_reference
 from app.routers import estimations
@@ -8,6 +9,14 @@ app = FastAPI(
     description="API for software project estimation using CAG architecture",
     version="0.1.0",
     docs_url=None # In order to deactivate /docs swagger default
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(estimations.router)

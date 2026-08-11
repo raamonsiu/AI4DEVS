@@ -1,0 +1,26 @@
+# Docker Compose configuration for local development.
+# For production, remove the bind mount and the --reload flag.
+
+services:
+  cag-estimator:
+    build: .
+    container_name: cag-estimator
+    ports:
+      - "8000:8000"
+
+    env_file:
+      - .env
+
+    volumes:
+      - ./app:/app/app
+
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+    restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
