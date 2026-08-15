@@ -12,5 +12,6 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.2",
     "scalar-fastapi>=1.8.2",
+    "streamlit>=1.61.1",
     "uvicorn[standard]>=0.52.1",
 ]
