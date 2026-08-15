@@ -1,18 +1,7 @@
-from openai import OpenAI
-from app.config import get_settings
 from app.context.examples import ESTIMATION_EXAMPLES
 from app.context.examples import format_examples
-from app.constants import MODELS_PRICING
+from app.dependencies import get_llm_wrapper
 from app.services.evaluation import evaluate_estimation_structure
-
-settings = get_settings()
-client = OpenAI(api_key=settings.OPENAI_API_KEY)
-
-def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
-    pricing = MODELS_PRICING.get(model, {"input": 0.50, "output": 1.50})
-    input_cost = (input_tokens / 1_000_000) * pricing["input"]
-    output_cost = (output_tokens / 1_000_000) * pricing["output"]
-    return round(input_cost + output_cost, 6)
 
 def build_system_prompt() -> str:
     examples_text = format_examples(ESTIMATION_EXAMPLES)
@@ -27,26 +16,15 @@ Generate a detailed estimation for the described project."""
 def generate_estimation(transcription: str) -> dict:
     system_prompt = build_system_prompt()
 
-    response = client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcription}
-        ]
-    )
-
-    estimation_text = response.choices[0].message.content
-    finish_reason = response.choices[0].finish_reason or "stop"
+    wrapper = get_llm_wrapper()
+    result = wrapper.complete(system_prompt=system_prompt, user_message=transcription)
 
     return {
-        "estimation": estimation_text,
-        "model": settings.LLM_MODEL,
-        "provider": settings.LLM_PROVIDER,
-        "tokens_used": response.usage.prompt_tokens + response.usage.completion_tokens,
-        "estimated_cost": calculate_cost(
-            settings.LLM_MODEL,
-            response.usage.prompt_tokens,
-            response.usage.completion_tokens
-        ),
-        "evaluation": evaluate_estimation_structure(estimation_text, finish_reason),
+        "estimation": result["estimation"],
+        "model": result["model"],
+        "provider": result["provider"],
+        "tokens_used": result["usage"]["input_tokens"] + result["usage"]["output_tokens"],
+        "estimated_cost": result["cost_usd"],
+        "cache_hit": result["cache_hit"],
+        "evaluation": evaluate_estimation_structure(result["estimation"], result["finish_reason"]),
     }

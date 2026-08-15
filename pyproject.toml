@@ -7,11 +7,16 @@ license = "MIT"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
+    "litellm>=1.96.2",
     "openai>=2.53.0",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.2",
+    "redis>=8.1.0",
     "scalar-fastapi>=1.8.2",
+    "sse-starlette>=3.4.8",
     "streamlit>=1.61.1",
+    "structlog>=26.1.0",
     "uvicorn[standard]>=0.52.1",
 ]

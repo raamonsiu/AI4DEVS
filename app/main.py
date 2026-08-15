@@ -1,14 +1,62 @@
+import structlog
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from scalar_fastapi import get_scalar_api_reference
+from app.config import get_settings
 from app.routers import estimations
+
+
+def configure_logging() -> None:
+    """Set up structlog: JSON in production, human-readable in development.
+
+    Every phase of an LLM call (cache check, dispatch, retry, fallback,
+    success/failure) logs through this configuration, so a single request can
+    be traced end-to-end when reviewing logs.
+    """
+    settings = get_settings()
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if settings.APP_ENV == "production"
+        else structlog.dev.ConsoleRenderer()
+    )
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            renderer,
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application startup/shutdown. Settings() validation (at least one API
+    key configured) runs here so the app fails fast instead of erroring on the
+    first request."""
+    configure_logging()
+    log = structlog.get_logger()
+    settings = get_settings()
+    log.info("application_started", environment=settings.APP_ENV, primary_model=settings.PRIMARY_MODEL, fallback_model=settings.FALLBACK_MODEL)
+    yield
+    log.info("application_shutdown")
+
 
 app = FastAPI(
     title="CAG Estimator",
     description="API for software project estimation using CAG architecture",
     version="0.1.0",
-    docs_url=None # In order to deactivate /docs swagger default
+    docs_url=None, # In order to deactivate /docs swagger default
+    lifespan=lifespan,
 )
 
 app.add_middleware(

@@ -7,6 +7,13 @@ class EstimationRequest(BaseModel):
         description="Client meet transcription summary."
     )
 
+class StreamEstimationRequest(BaseModel):
+    transcription: str = Field(
+        ...,
+        min_length=50,
+        description="Client meet transcription summary."
+    )
+
 class EvaluationResult(BaseModel):
     has_title: bool
     has_task_breakdown: bool
@@ -31,6 +38,10 @@ class EstimationResponse(BaseModel):
     estimated_cost: float = Field(
         ...,
         description="Estimated cost in USD"
+    )
+    cache_hit: bool = Field(
+        default=False,
+        description="True when the response was served from the Redis cache"
     )
     evaluation: EvaluationResult = Field(
         ...,
