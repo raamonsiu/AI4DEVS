@@ -6,9 +6,12 @@
 ![Version](https://img.shields.io/badge/version-0.1.0-lightgrey)
 ![uv](https://img.shields.io/badge/package%20manager-uv-de5fe9)
 ![Docker](https://img.shields.io/badge/docker-ready-2496ED)
+![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 API for software project estimation using LLMs, based on a CAG (Context-Augmented Generation) architecture: historical estimation examples are injected into the prompt to guide the model toward more accurate and consistent budgets.
+
+A Streamlit chat UI is also included as a lightweight front-end to interact with the same system prompt and CAG examples used by the API.
 
 ## Project Structure
 ```
@@ -26,6 +29,7 @@ cag-estimator/
 │   │   └── examples.py
 │   └── schemas/            -- Request/response schemas
 │       └── estimations.py
+├── streamlit_app.py         -- Streamlit chat UI (shares the API's system prompt)
 ├── .env.example
 ├── pyproject.toml
 └── README.md
@@ -55,6 +59,16 @@ The API will be available at `http://127.0.0.1:8000`. Interactive docs at `/docs
 ```bash
 docker compose up --build
 ```
+
+## Running the Streamlit Chat
+```bash
+uv run streamlit run streamlit_app.py
+```
+
+The chat UI reads `OPENAI_API_KEY` from the same `.env` file used by the API (no separate `secrets.toml` needed) and reuses the exact system prompt built by `app/services/llm_service.py`. Its sidebar shows:
+- The active system prompt (read-only)
+- The static CAG examples injected into it (read-only)
+- Model, input/output tokens and response time for the last call
 
 ## Environment Variables
 See [`.env.example`](.env.example) for the full list of variables and their possible values.
