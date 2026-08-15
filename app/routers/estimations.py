@@ -1,4 +1,5 @@
 import asyncio
+import json
 from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends
@@ -26,9 +27,11 @@ async def estimate_stream(
 
     async def event_generator() -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
+        meta_holder: dict = {}
         chunks = wrapper.complete_stream(
             system_prompt=system_prompt,
             user_message=request.transcription,
+            meta_holder=meta_holder,
         )
 
         def _next_chunk() -> str | None:
@@ -44,6 +47,7 @@ async def estimate_stream(
                     break
                 if chunk:
                     yield {"event": "token", "data": chunk}
+            yield {"event": "meta", "data": json.dumps(meta_holder)}
             yield {"event": "done", "data": "[DONE]"}
         except Exception as exc:
             yield {"event": "error", "data": str(exc)}

@@ -6,7 +6,20 @@ from app.services.evaluation import evaluate_estimation_structure
 def build_system_prompt() -> str:
     examples_text = format_examples(ESTIMATION_EXAMPLES)
     return f"""You are a software projects estimation expert.
-    
+
+Use a developer rate of 62.50 EUR/hour. Generate the estimation with this exact structure:
+
+## Estimation: <project name>
+
+### Task Breakdown:
+| Task | Hours | Cost (EUR) |
+[one row per task; cost = hours * 62.50 EUR]
+
+**Total Estimated Hours: <number> hours**
+**Total Estimated Cost: <number> EUR**
+**Recommended Team: <composition>**
+**Estimated Duration: <weeks>**
+
 Use the following historical budgets as a reference:
 
 {examples_text}

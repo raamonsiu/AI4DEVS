@@ -8,6 +8,7 @@
 # purely for display (no LLM call involved), from the same functions the API
 # uses, so what you see is guaranteed to match what the API actually sends.
 
+import json
 import time
 import httpx
 import streamlit as st
@@ -21,13 +22,14 @@ STREAM_ENDPOINT = f"{settings.ESTIMATOR_API_BASE_URL.rstrip('/')}/api/v1/estimat
 system_prompt = build_system_prompt()
 examples_text = format_examples(ESTIMATION_EXAMPLES)
 
-def stream_estimation(transcription: str):
+def stream_estimation(transcription: str, meta_holder: dict):
     """POST to the SSE endpoint and yield text chunks as they arrive.
 
     Per the SSE spec, a message can carry multiple `data:` lines that must be
     joined with `\\n` to reconstruct the payload, and a blank line terminates
     the message. Line endings vary by server (`\\n` vs `\\r\\n`), so both are
-    accepted.
+    accepted. The final `meta` event (cache hit, cost, model) is parsed into
+    ``meta_holder`` instead of being yielded as chat text.
     """
     payload = {"transcription": transcription}
     with httpx.stream(
@@ -47,6 +49,8 @@ def stream_estimation(transcription: str):
                     data_lines = []
                     if current_event == "token":
                         yield payload_text
+                    elif current_event == "meta":
+                        meta_holder.update(json.loads(payload_text))
                     elif current_event == "error":
                         yield f"\n\n[error] {payload_text}"
                     elif current_event == "done":
@@ -76,7 +80,13 @@ with st.sidebar:
     st.header("Last Call Metrics")
     last_call = st.session_state.get("last_call")
     if last_call:
-        st.metric("Response time (s)", last_call["elapsed"])
+        st.metric("Response time (s)", f"{last_call['elapsed']:.2f}")
+        # Costs are tiny (fractions of a cent) : st.metric would otherwise
+        # round a raw float like 0.000385 down to "$0.00". Format explicitly.
+        st.metric("Estimated cost (USD)", f"${last_call.get('cost_usd', 0.0):.6f}")
+        st.metric("Cache hit", "Yes" if last_call.get("cache_hit") else "No")
+        if last_call.get("model"):
+            st.caption(f"Answered by `{last_call['model']}` ({last_call.get('provider', 'unknown')})")
     else:
         st.caption("No calls made yet.")
 
@@ -100,9 +110,10 @@ if prompt := st.chat_input("Type your message: "):
     with st.chat_message("assistant"):
         placeholder = st.empty()
         full_response = ""
+        meta_holder = {}
         start_time = time.time()
         try:
-            for chunk in stream_estimation(prompt):
+            for chunk in stream_estimation(prompt, meta_holder):
                 full_response += chunk
                 placeholder.markdown(full_response + "▍")
             placeholder.markdown(full_response)
@@ -112,5 +123,11 @@ if prompt := st.chat_input("Type your message: "):
         elapsed = round(time.time() - start_time, 2)
 
     st.session_state.messages.append({"role": "assistant", "content": full_response})
-    st.session_state.last_call = {"elapsed": elapsed}
+    st.session_state.last_call = {
+        "elapsed": elapsed,
+        "cost_usd": meta_holder.get("cost_usd", 0.0),
+        "cache_hit": meta_holder.get("cache_hit", False),
+        "model": meta_holder.get("model"),
+        "provider": meta_holder.get("provider"),
+    }
     st.rerun()

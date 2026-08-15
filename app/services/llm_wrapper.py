@@ -182,9 +182,16 @@ class LLMWrapper:
         system_prompt: str,
         user_message: str,
         max_tokens: int = 4000,
+        meta_holder: dict[str, Any] | None = None,
     ) -> Iterator[str]:
         """Yield text chunks as they arrive. A cache hit replays the cached text
-        as a single chunk so the client UX stays consistent either way."""
+        as a single chunk so the client UX stays consistent either way.
+
+        If ``meta_holder`` is passed, it is populated in place with
+        ``cache_hit``, ``cost_usd``, ``model`` and ``provider`` once the
+        generator is exhausted — callers that need that metadata (e.g. the SSE
+        router, to emit a final event) read it after the ``for`` loop ends.
+        """
         cache_key = EstimationCache.make_key(
             system_prompt=system_prompt,
             user_message=user_message,
@@ -194,6 +201,13 @@ class LLMWrapper:
         cached = self.cache.get(cache_key)
         if cached:
             log.info("stream_cache_hit", chars=len(cached.get("estimation", "")))
+            if meta_holder is not None:
+                meta_holder.update(
+                    cache_hit=True,
+                    cost_usd=cached.get("cost_usd", 0.0),
+                    model=cached.get("model", self.primary_model),
+                    provider=cached.get("provider", _provider_from_model(self.primary_model)),
+                )
             yield cached.get("estimation", "")
             return
 
@@ -205,15 +219,27 @@ class LLMWrapper:
         log.info("llm_stream_started", primary_model=self.primary_model)
         t0 = time.perf_counter()
         full_text: list[str] = []
+        usage_chunk: Any = None
+        model_seen: str | None = None
         try:
             response = self.router.completion(
-                model="estimator", messages=messages, max_tokens=max_tokens, stream=True
+                model="estimator",
+                messages=messages,
+                max_tokens=max_tokens,
+                stream=True,
+                stream_options={"include_usage": True},
             )
             for chunk in response:
                 delta = _extract_delta(chunk)
                 if delta:
                     full_text.append(delta)
                     yield delta
+                # The final chunk of the stream carries cumulative usage
+                # (OpenAI/Anthropic both do this via LiteLLM's stream_options).
+                if getattr(chunk, "usage", None):
+                    usage_chunk = chunk.usage
+                if getattr(chunk, "model", None):
+                    model_seen = chunk.model
         except Exception as exc:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             log.error(
@@ -226,23 +252,35 @@ class LLMWrapper:
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
         rendered = "".join(full_text)
-        log.info("llm_stream_completed", latency_ms=latency_ms, chars=len(rendered))
+        model = _normalise_model_name(model_seen or self.primary_model)
+        provider = _provider_from_model(model)
+        input_tokens = getattr(usage_chunk, "prompt_tokens", 0) or 0
+        output_tokens = getattr(usage_chunk, "completion_tokens", 0) or 0
+        cost_usd = _estimate_cost(model, input_tokens, output_tokens)
+        log.info(
+            "llm_stream_completed",
+            latency_ms=latency_ms,
+            chars=len(rendered),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cost_usd=cost_usd,
+        )
 
-        # Streaming responses don't reliably report token usage, so the cached
-        # entry carries zeroed usage/cost — a later exact-match blocking call
-        # for the same input will still get properly costed and overwrite it.
         self.cache.set(
             cache_key,
             {
                 "estimation": rendered,
-                "model": self.primary_model,
-                "provider": _provider_from_model(self.primary_model),
+                "model": model,
+                "provider": provider,
                 "finish_reason": "stop",
-                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
                 "latency_ms": latency_ms,
-                "cost_usd": 0.0,
+                "cost_usd": cost_usd,
             },
         )
+
+        if meta_holder is not None:
+            meta_holder.update(cache_hit=False, cost_usd=cost_usd, model=model, provider=provider)
 
     @staticmethod
     def _normalise_response(response: Any, *, latency_ms: int) -> dict[str, Any]:

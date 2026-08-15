@@ -16,13 +16,17 @@ class StreamEstimationRequest(BaseModel):
 
 class EvaluationResult(BaseModel):
     has_title: bool
-    has_task_breakdown: bool
+    has_breakdown_table: bool
     has_total_hours: bool
+    has_total_cost: bool
     has_team_section: bool
     has_duration_section: bool
     declared_total_hours: float | None
     sum_task_hours: float | None
     hours_match: bool | None
+    declared_total_cost: float | None
+    sum_task_cost: float | None
+    cost_match: bool | None
     finish_reason_ok: bool
     score: float = Field(..., description="Structural quality score between 0 and 1")
     issues: list[str]
