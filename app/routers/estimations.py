@@ -2,18 +2,28 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Depends
+import structlog
+from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 from app.dependencies import get_llm_wrapper
 from app.schemas.estimations import EstimationRequest, EstimationResponse, StreamEstimationRequest
+from app.services.guardrails import InputModerationError, validate_input
 from app.services.llm_service import build_system_prompt, generate_estimation
 from app.services.llm_wrapper import LLMWrapper
+
+log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1", tags=["estimations"])
 
 @router.post("/estimate", response_model=EstimationResponse)
 async def estimate(request: EstimationRequest):
+    try:
+        validate_input(request.transcription)
+    except InputModerationError as exc:
+        log.warning("estimation_v1_input_rejected", error=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     result = generate_estimation(request.transcription)
     return result
 
@@ -23,6 +33,12 @@ async def estimate_stream(
     wrapper: LLMWrapper = Depends(get_llm_wrapper),
 ) -> EventSourceResponse:
     """Stream a software estimation token by token via Server-Sent Events."""
+    try:
+        validate_input(request.transcription)
+    except InputModerationError as exc:
+        log.warning("estimation_v1_stream_input_rejected", error=str(exc))
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     system_prompt = build_system_prompt()
 
     async def event_generator() -> AsyncIterator[dict]:

@@ -19,8 +19,28 @@ from app.services.llm_service import build_system_prompt
 settings = get_settings()
 STREAM_ENDPOINT = f"{settings.ESTIMATOR_API_BASE_URL.rstrip('/')}/api/v1/estimate/stream"
 
+MIN_MESSAGE_LENGTH = 50
+
 system_prompt = build_system_prompt()
 examples_text = format_examples(ESTIMATION_EXAMPLES)
+
+def format_rejection_message(detail) -> str:
+    """Turn an API rejection into a message fit for the end user.
+
+    - Our own guardrail errors (400/502) already send a plain, user-facing
+      string as `detail` : shown as-is.
+    - FastAPI's built-in validation errors (422) send a list of technical
+      dicts (field/type/msg) : translated into a short, readable sentence.
+    """
+    if isinstance(detail, list):
+        field_names = {"transcription": "your message"}
+        parts = []
+        for err in detail:
+            loc = err.get("loc", [])
+            field = field_names.get(loc[-1], loc[-1]) if loc else "your input"
+            parts.append(f"{field} : {err.get('msg', 'is invalid')}")
+        return "Please check your message: " + "; ".join(parts) + "."
+    return str(detail)
 
 def stream_estimation(transcription: str, meta_holder: dict):
     """POST to the SSE endpoint and yield text chunks as they arrive.
@@ -39,7 +59,18 @@ def stream_estimation(transcription: str, meta_holder: dict):
         timeout=httpx.Timeout(120.0, connect=10.0),
         headers={"Accept": "text/event-stream"},
     ) as response:
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Must read the body here, while the stream is still open : once
+            # this `with` block exits (e.g. the exception propagating out),
+            # httpx closes the underlying stream and reading it afterwards
+            # raises StreamClosed. Bake the message into a plain exception
+            # instead of re-raising response.raise_for_status()'s.
+            response.read()
+            try:
+                detail = response.json().get("detail", response.text)
+            except ValueError:
+                detail = response.text
+            raise RuntimeError(format_rejection_message(detail))
         current_event = "token"
         data_lines = []
         for raw_line in response.iter_lines():
@@ -100,15 +131,27 @@ for message in st.session_state.messages:
         st.markdown(message["content"])
 
 # User input
-if prompt := st.chat_input("Type your message: "):
+if prompt := st.chat_input(f"Describe your software project (min {MIN_MESSAGE_LENGTH} characters)..."):
     # Show users message
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Generate and show answer (streaming from the FastAPI SSE endpoint)
     with st.chat_message("assistant"):
         placeholder = st.empty()
+
+        # Fast client-side check: no point round-tripping to the API (and
+        # eventually the LLM) for something we already know is too short.
+        if len(prompt) < MIN_MESSAGE_LENGTH:
+            full_response = (
+                f"Your message is too short ({len(prompt)} characters). Please "
+                f"describe your project in at least {MIN_MESSAGE_LENGTH} "
+                "characters so there's enough to estimate."
+            )
+            placeholder.error(full_response)
+            st.session_state.messages.append({"role": "assistant", "content": full_response})
+            st.stop()
+
         full_response = ""
         meta_holder = {}
         start_time = time.time()
@@ -117,6 +160,12 @@ if prompt := st.chat_input("Type your message: "):
                 full_response += chunk
                 placeholder.markdown(full_response + "▍")
             placeholder.markdown(full_response)
+        except RuntimeError as exc:
+            # The API rejected the request (e.g. 422 validation, 400 guardrail,
+            # 502 model failure) : surface its actual detail, not a generic
+            # "connection failed" message.
+            full_response = str(exc)
+            placeholder.error(full_response)
         except httpx.HTTPError as exc:
             full_response = f"Could not reach the estimator at `{STREAM_ENDPOINT}`: {exc}"
             placeholder.error(full_response)

@@ -43,17 +43,25 @@ class EstimationCache:
         return cls(redis.from_url(url, decode_responses=True), ttl=ttl)
 
     @staticmethod
-    def make_key(*, system_prompt: str, user_message: str, model: str, max_tokens: int) -> str:
-        payload = json.dumps(
-            {
-                "system_prompt": system_prompt,
-                "user_message": normalize_text(user_message),
-                "model": model,
-                "max_tokens": max_tokens,
-            },
-            sort_keys=True,
-        )
-        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    def make_key(
+        *,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        max_tokens: int,
+        response_model: str | None = None,
+    ) -> str:
+        payload = {
+            "system_prompt": system_prompt,
+            "user_message": normalize_text(user_message),
+            "model": model,
+            "max_tokens": max_tokens,
+        }
+        if response_model is not None:
+            # Only added for structured calls, so plain-text cache keys
+            # (response_model=None) hash identically to before this field existed.
+            payload["response_model"] = response_model
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
         return f"estimation:{digest}"
 
     def get(self, key: str) -> dict[str, Any] | None:

@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
     "httpx>=0.28.1",
+    "instructor>=1.15.4",
     "litellm>=1.96.2",
     "openai>=2.53.0",
     "pydantic>=2.13.4",
@@ -20,3 +21,11 @@ dependencies = [
     "structlog>=26.1.0",
     "uvicorn[standard]>=0.52.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

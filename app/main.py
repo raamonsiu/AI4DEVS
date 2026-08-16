@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from scalar_fastapi import get_scalar_api_reference
 from app.config import get_settings
-from app.routers import estimations
+from app.routers import estimation_v2, estimations
 
 
 def configure_logging() -> None:
@@ -68,6 +68,7 @@ app.add_middleware(
 )
 
 app.include_router(estimations.router)
+app.include_router(estimation_v2.router)
 
 @app.get("/docs", include_in_schema=False)
 async def scalar_docs():
