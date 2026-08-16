@@ -24,4 +24,6 @@ def get_llm_wrapper() -> LLMWrapper:
         timeout=settings.LLM_TIMEOUT,
         num_retries=settings.LLM_RETRIES,
         cache=get_cache(),
+        semantic_cache_threshold=settings.SEMANTIC_CACHE_THRESHOLD,
+        semantic_cache_max_entries=settings.SEMANTIC_CACHE_MAX_ENTRIES,
     )

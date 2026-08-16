@@ -22,6 +22,20 @@ class Settings(BaseSettings):
     REDIS_URL: str = "redis://localhost:6379"
     CACHE_TTL: int = 86400
 
+    # Semantic cache: on an exact-match miss, embed the message and look for a
+    # prior response above this cosine-similarity threshold within the same
+    # bucket (same system prompt + model). OpenAI-only, like moderation: with
+    # no OPENAI_API_KEY it silently no-ops and only the exact-match cache runs.
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    # 0.80, not 0.92: calibrated live against text-embedding-3-small, where a
+    # genuine paraphrase of the same project lands around 0.81 cosine
+    # similarity (not 0.92+ as a naive "1 - distance_threshold" conversion
+    # from other similarity spaces would suggest), while an unrelated project
+    # in the same bucket lands around 0.33-0.60. 0.80 catches the paraphrase
+    # with a wide safety margin above both negative cases.
+    SEMANTIC_CACHE_THRESHOLD: float = 0.80
+    SEMANTIC_CACHE_MAX_ENTRIES: int = 200
+
     # Base URL the Streamlit client uses to reach this API
     ESTIMATOR_API_BASE_URL: str = "http://localhost:8000"
 

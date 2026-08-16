@@ -35,6 +35,7 @@ from pydantic import BaseModel
 
 from app.constants import MODELS_PRICING
 from app.services.cache import EstimationCache
+from app.services.embeddings import embed_text
 
 log = structlog.get_logger()
 
@@ -96,12 +97,16 @@ class LLMWrapper:
         timeout: int,
         num_retries: int,
         cache: EstimationCache,
+        semantic_cache_threshold: float = 0.92,
+        semantic_cache_max_entries: int = 200,
     ):
         self.primary_model = primary_model
         self.fallback_model = fallback_model
         self.timeout = timeout
         self.num_retries = num_retries
         self.cache = cache
+        self.semantic_cache_threshold = semantic_cache_threshold
+        self.semantic_cache_max_entries = semantic_cache_max_entries
 
         self.router = Router(
             model_list=[
@@ -151,6 +156,13 @@ class LLMWrapper:
         if cached:
             return {**cached, "cache_hit": True}
 
+        bucket_key = EstimationCache.make_bucket_key(system_prompt=system_prompt, model=self.primary_model)
+        query_embedding = embed_text(user_message)
+        if query_embedding is not None:
+            semantic_hit = self.cache.get_semantic(bucket_key, query_embedding, self.semantic_cache_threshold)
+            if semantic_hit:
+                return {**semantic_hit, "cache_hit": True}
+
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -185,6 +197,8 @@ class LLMWrapper:
             finish_reason=result["finish_reason"],
         )
         self.cache.set(cache_key, result)
+        if query_embedding is not None:
+            self.cache.set_semantic(bucket_key, query_embedding, result, self.semantic_cache_max_entries)
         return {**result, "cache_hit": False}
 
     def complete_structured(
@@ -215,6 +229,21 @@ class LLMWrapper:
                 "cost_usd": cached.get("cost_usd", 0.0),
                 "cache_hit": True,
             }
+
+        bucket_key = EstimationCache.make_bucket_key(
+            system_prompt=system_prompt, model=self.primary_model, response_model=response_model.__name__
+        )
+        query_embedding = embed_text(user_message)
+        if query_embedding is not None:
+            semantic_hit = self.cache.get_semantic(bucket_key, query_embedding, self.semantic_cache_threshold)
+            if semantic_hit:
+                return {
+                    "result": response_model.model_validate(semantic_hit["result"]),
+                    "model": semantic_hit["model"],
+                    "provider": semantic_hit["provider"],
+                    "cost_usd": semantic_hit.get("cost_usd", 0.0),
+                    "cache_hit": True,
+                }
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -263,17 +292,22 @@ class LLMWrapper:
             latency_ms=latency_ms,
         )
 
-        self.cache.set(
-            cache_key,
-            {
-                "result": result.model_dump(),
-                "model": model,
-                "provider": provider,
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                "latency_ms": latency_ms,
-                "cost_usd": cost_usd,
-            },
-        )
+        # `result` only exists here because create_with_completion() already
+        # validated it against response_model (including any model_validator) :
+        # Instructor raises and retries internally on validation failure. So
+        # both cache writes below only ever store output that already passed
+        # the output-side guardrails.
+        cache_payload = {
+            "result": result.model_dump(),
+            "model": model,
+            "provider": provider,
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "latency_ms": latency_ms,
+            "cost_usd": cost_usd,
+        }
+        self.cache.set(cache_key, cache_payload)
+        if query_embedding is not None:
+            self.cache.set_semantic(bucket_key, query_embedding, cache_payload, self.semantic_cache_max_entries)
 
         return {"result": result, "model": model, "provider": provider, "cost_usd": cost_usd, "cache_hit": False}
 
@@ -311,6 +345,22 @@ class LLMWrapper:
                 )
             yield cached.get("estimation", "")
             return
+
+        bucket_key = EstimationCache.make_bucket_key(system_prompt=system_prompt, model=self.primary_model)
+        query_embedding = embed_text(user_message)
+        if query_embedding is not None:
+            semantic_hit = self.cache.get_semantic(bucket_key, query_embedding, self.semantic_cache_threshold)
+            if semantic_hit:
+                log.info("stream_semantic_cache_hit", chars=len(semantic_hit.get("estimation", "")))
+                if meta_holder is not None:
+                    meta_holder.update(
+                        cache_hit=True,
+                        cost_usd=semantic_hit.get("cost_usd", 0.0),
+                        model=semantic_hit.get("model", self.primary_model),
+                        provider=semantic_hit.get("provider", _provider_from_model(self.primary_model)),
+                    )
+                yield semantic_hit.get("estimation", "")
+                return
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -367,18 +417,18 @@ class LLMWrapper:
             cost_usd=cost_usd,
         )
 
-        self.cache.set(
-            cache_key,
-            {
-                "estimation": rendered,
-                "model": model,
-                "provider": provider,
-                "finish_reason": "stop",
-                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-                "latency_ms": latency_ms,
-                "cost_usd": cost_usd,
-            },
-        )
+        stream_cache_payload = {
+            "estimation": rendered,
+            "model": model,
+            "provider": provider,
+            "finish_reason": "stop",
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "latency_ms": latency_ms,
+            "cost_usd": cost_usd,
+        }
+        self.cache.set(cache_key, stream_cache_payload)
+        if query_embedding is not None:
+            self.cache.set_semantic(bucket_key, query_embedding, stream_cache_payload, self.semantic_cache_max_entries)
 
         if meta_holder is not None:
             meta_holder.update(cache_hit=False, cost_usd=cost_usd, model=model, provider=provider)
