@@ -16,3 +16,41 @@ def test_estimation_prompt_includes_description_in_user_block():
     assert "Mobile app with login" in user
     assert "phases_table" in system
     assert "confidence_pct" in system
+
+
+def test_output_format_keyword_only_present_for_its_own_branch():
+    base_kwargs = dict(
+        description="Mobile app with login, chat and push notifications.",
+        project_type=ProjectType.MOBILE_APP,
+        detail_level=DetailLevel.MEDIUM,
+    )
+
+    phases_table_request = EstimationRequest(output_format=OutputFormat.PHASES_TABLE, **base_kwargs)
+    narrative_request = EstimationRequest(output_format=OutputFormat.NARRATIVE, **base_kwargs)
+
+    phases_table_system, _ = render_estimation_prompt(phases_table_request)
+    narrative_system, _ = render_estimation_prompt(narrative_request)
+
+    # "phases_table" only ever appears via the <output_format> tag rendering
+    # that exact enum value : unlike "confidence_pct", it isn't also present
+    # in the always-included few-shot examples, so it cleanly distinguishes
+    # the branch actually taken.
+    assert "phases_table" in phases_table_system
+    assert "phases_table" not in narrative_system
+
+
+def test_detailed_level_adds_per_phase_assumptions_instruction():
+    base_kwargs = dict(
+        description="Mobile app with login, chat and push notifications.",
+        project_type=ProjectType.MOBILE_APP,
+        output_format=OutputFormat.PHASES_TABLE,
+    )
+
+    detailed_request = EstimationRequest(detail_level=DetailLevel.DETAILED, **base_kwargs)
+    summary_request = EstimationRequest(detail_level=DetailLevel.SUMMARY, **base_kwargs)
+
+    detailed_system, _ = render_estimation_prompt(detailed_request)
+    summary_system, _ = render_estimation_prompt(summary_request)
+
+    assert "list the assumptions" in detailed_system
+    assert "list the assumptions" not in summary_system
