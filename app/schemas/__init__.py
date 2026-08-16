@@ -7,6 +7,7 @@ from app.schemas.estimation import (
     OutputFormat,
     Phase,
     ProjectType,
+    ReferenceProject,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "ProjectType",
     "DetailLevel",
     "OutputFormat",
+    "ReferenceProject",
 ]

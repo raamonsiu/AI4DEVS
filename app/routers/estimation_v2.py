@@ -1,6 +1,7 @@
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from instructor.v2.core.errors import InstructorError
+from jinja2 import TemplateNotFound
 
 from app.dependencies import get_llm_wrapper
 from app.prompts.loader import render_estimation_prompt
@@ -12,11 +13,10 @@ log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v2", tags=["estimations-v2"])
 
-PROMPT_VERSION = "v1"
-
 @router.post("/estimate", response_model=EstimationResponse)
 def estimate(
     request: EstimationRequest,
+    prompt_version: str = Query("v1", description="Prompt template version, e.g. 'v1' or 'v2'."),
     wrapper: LLMWrapper = Depends(get_llm_wrapper),
 ) -> EstimationResponse:
     try:
@@ -25,7 +25,11 @@ def estimate(
         log.warning("estimation_v2_input_rejected", error=str(exc))
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    system, user = render_estimation_prompt(request)
+    try:
+        system, user = render_estimation_prompt(request, version=prompt_version)
+    except TemplateNotFound as exc:
+        raise HTTPException(status_code=400, detail=f"Unknown prompt_version '{prompt_version}'.") from exc
+
     try:
         outcome = wrapper.complete_structured(
             system_prompt=system,
@@ -50,4 +54,4 @@ def estimate(
         confidence_pct=draft.confidence_pct,
         phases=draft.phases,
     )
-    return EstimationResponse(result=result, prompt_version=PROMPT_VERSION)
+    return EstimationResponse(result=result, prompt_version=prompt_version)

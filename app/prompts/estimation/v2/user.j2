@@ -4,13 +4,12 @@
 
 {% if reference_projects %}
 <reference_projects>
-The client has supplied these actual past projects as an additional
-calibration anchor, on top of the examples above. Use them only where
-genuinely relevant : don't force a match that isn't there.
+Actual past projects supplied for calibration : use only where genuinely
+relevant, don't force a match:
 {% for rp in reference_projects %}
 - {{ rp.name }}: {{ rp.description }} (actual: {{ rp.actual_duration_weeks }} weeks, {{ rp.actual_cost_eur }} EUR)
 {% endfor %}
 </reference_projects>
 {% endif %}
 
-Estimate this project following the rules above.
+Estimate this project. Lead with the key risk.

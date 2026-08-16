@@ -1,5 +1,8 @@
+import pytest
+from jinja2 import TemplateNotFound
+
 from app.prompts.loader import render_estimation_prompt
-from app.schemas import DetailLevel, EstimationRequest, OutputFormat, ProjectType
+from app.schemas import DetailLevel, EstimationRequest, OutputFormat, ProjectType, ReferenceProject
 
 
 def test_estimation_prompt_includes_description_in_user_block():
@@ -54,3 +57,63 @@ def test_detailed_level_adds_per_phase_assumptions_instruction():
 
     assert "list the assumptions" in detailed_system
     assert "list the assumptions" not in summary_system
+
+
+def test_v2_prompt_version_is_a_deliberately_different_variant():
+    request = EstimationRequest(
+        description="Mobile app with login, chat and push notifications.",
+        project_type=ProjectType.MOBILE_APP,
+        detail_level=DetailLevel.MEDIUM,
+        output_format=OutputFormat.PHASES_TABLE,
+    )
+
+    v1_system, _ = render_estimation_prompt(request, version="v1")
+    v2_system, _ = render_estimation_prompt(request, version="v2")
+
+    assert v1_system != v2_system
+    # v2's deliberate variation: a risk-first framing absent from v1.
+    assert "Key risk" in v2_system
+    assert "Key risk" not in v1_system
+
+
+def test_unknown_prompt_version_raises():
+    request = EstimationRequest(
+        description="Mobile app with login, chat and push notifications.",
+        project_type=ProjectType.MOBILE_APP,
+        detail_level=DetailLevel.MEDIUM,
+        output_format=OutputFormat.PHASES_TABLE,
+    )
+
+    with pytest.raises(TemplateNotFound):
+        render_estimation_prompt(request, version="v99")
+
+
+def test_reference_projects_are_rendered_when_present():
+    request_with_refs = EstimationRequest(
+        description="Mobile app with login, chat and push notifications.",
+        project_type=ProjectType.MOBILE_APP,
+        detail_level=DetailLevel.MEDIUM,
+        output_format=OutputFormat.PHASES_TABLE,
+        reference_projects=[
+            ReferenceProject(
+                name="Acme Loyalty App",
+                description="A loyalty points mobile app for a retail chain.",
+                actual_duration_weeks=9,
+                actual_cost_eur=18000,
+            )
+        ],
+    )
+    request_without_refs = EstimationRequest(
+        description="Mobile app with login, chat and push notifications.",
+        project_type=ProjectType.MOBILE_APP,
+        detail_level=DetailLevel.MEDIUM,
+        output_format=OutputFormat.PHASES_TABLE,
+    )
+
+    _, user_with_refs = render_estimation_prompt(request_with_refs)
+    _, user_without_refs = render_estimation_prompt(request_without_refs)
+
+    assert "<reference_projects>" in user_with_refs
+    assert "Acme Loyalty App" in user_with_refs
+    assert "18000" in user_with_refs
+    assert "<reference_projects>" not in user_without_refs

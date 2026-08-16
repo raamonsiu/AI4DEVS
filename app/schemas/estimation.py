@@ -22,11 +22,22 @@ class OutputFormat(str, Enum):
     NARRATIVE = "narrative"
 
 
+class ReferenceProject(BaseModel):
+    """An actual past project the client wants used as a calibration anchor,
+    on top of the model's own few-shot examples."""
+
+    name: str
+    description: str
+    actual_duration_weeks: int = Field(ge=1, le=104)
+    actual_cost_eur: int = Field(ge=0)
+
+
 class EstimationRequest(BaseModel):
     description: str = Field(min_length=20, max_length=2000)
     project_type: ProjectType
     detail_level: DetailLevel
     output_format: OutputFormat
+    reference_projects: list[ReferenceProject] | None = None
 
 
 class Phase(BaseModel):
