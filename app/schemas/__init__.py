@@ -1,4 +1,7 @@
 from app.schemas.estimation import (
+    LOW_CONFIDENCE_THRESHOLD,
+    OUT_OF_SCOPE_PREFIX,
+    CallMeta,
     DetailLevel,
     EstimationDraft,
     EstimationRequest,
@@ -7,7 +10,6 @@ from app.schemas.estimation import (
     OutputFormat,
     Phase,
     ProjectType,
-    ReferenceProject,
 )
 
 __all__ = [
@@ -15,9 +17,11 @@ __all__ = [
     "EstimationResponse",
     "EstimationResult",
     "EstimationDraft",
+    "CallMeta",
     "Phase",
     "ProjectType",
     "DetailLevel",
     "OutputFormat",
-    "ReferenceProject",
+    "OUT_OF_SCOPE_PREFIX",
+    "LOW_CONFIDENCE_THRESHOLD",
 ]

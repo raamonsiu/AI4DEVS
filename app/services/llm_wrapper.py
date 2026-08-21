@@ -1,27 +1,24 @@
-# LiteLLM-backed wrapper: one call site for every LLM interaction in the
-# estimator, adding provider fallback, an exact-match cache, cost tracking,
-# and structured logging on top of the raw provider call.
-#
-# Fallback strategy
-# ------------------
-# A single provider/model with no plan B means an expired key, a rate limit,
-# or an outage takes the whole feature down. The Router below is configured
-# with two deployments under the same logical "estimator" model name : primary
-# first, fallback second : plus its own retry budget. LiteLLM's Router already
-# implements the escalation this project wants:
-#   1. Try the primary model.
-#   2. On a transient error, retry the primary model up to LLM_RETRIES times.
-#   3. If it still fails (or the error is non-retryable, e.g. no credits),
-#      fall over to the fallback deployment.
-# Different failure classes (rate limit vs. auth vs. timeout) are handled
-# internally by LiteLLM's retry/fallback policy rather than reimplemented here.
-#
-# Cache
-# -----
-# Every call checks the cache first (see cache.py for the key derivation) and
-# populates it after a successful response. Streaming responses are cached as
-# a single joined string and replayed as one chunk on a hit, so the UX stays
-# consistent whether or not the answer was cached.
+"""LiteLLM-backed wrapper that adds provider fallback, cost tracking and
+structured logging to every LLM call in the estimator.
+
+Design notes
+------------
+- The wrapper exposes two primitives:
+  - ``complete()``: free-text answer, cached by the exact-match cache.
+  - ``complete_structured()``: returns a validated Pydantic model via Instructor,
+    re-prompting on validator errors up to ``max_retries`` times. Caching for
+    this path lives in ``app/services/estimation.py`` (the service owns the
+    pipeline order: guardrails → caches → LLM → output guardrail → cache write).
+- The Router is configured with two deployments under the same ``model_name``
+  ("estimator") so LiteLLM can switch from primary to fallback transparently:
+    1. Try the primary model.
+    2. On a transient error, retry it up to ``num_retries`` times.
+    3. If it still fails, fall over to the fallback deployment.
+- Instructor wraps the *Router's* ``completion`` (not bare ``litellm.completion``)
+  so structured calls get the same primary→fallback escalation as free-text
+  ones. Wrapping ``litellm.completion`` directly would silently drop the
+  fallback guarantee for the only endpoint this service exposes.
+"""
 
 from __future__ import annotations
 
@@ -35,11 +32,10 @@ from pydantic import BaseModel
 
 from app.constants import MODELS_PRICING
 from app.services.cache import EstimationCache
-from app.services.embeddings import embed_text
 
 log = structlog.get_logger()
 
-ResultT = TypeVar("ResultT", bound=BaseModel)
+T = TypeVar("T", bound=BaseModel)
 
 
 def _normalise_model_name(model: str) -> str:
@@ -97,16 +93,14 @@ class LLMWrapper:
         timeout: int,
         num_retries: int,
         cache: EstimationCache,
-        semantic_cache_threshold: float = 0.92,
-        semantic_cache_max_entries: int = 200,
     ):
+        self.openai_api_key = openai_api_key
+        self.anthropic_api_key = anthropic_api_key
         self.primary_model = primary_model
         self.fallback_model = fallback_model
         self.timeout = timeout
         self.num_retries = num_retries
         self.cache = cache
-        self.semantic_cache_threshold = semantic_cache_threshold
-        self.semantic_cache_max_entries = semantic_cache_max_entries
 
         self.router = Router(
             model_list=[
@@ -131,12 +125,11 @@ class LLMWrapper:
             num_retries=num_retries,
         )
 
-        # Wrapping the Router's own `.completion` (rather than bare
-        # `litellm.completion`) means structured calls get the same
-        # primary/fallback escalation as plain-text ones : Instructor just
-        # forces the provider's native structured-output mechanism (OpenAI
-        # Structured Outputs, Anthropic tool use, ...) on top of it.
-        self.instructor_client = instructor.from_litellm(self.router.completion)
+        self._instructor = instructor.from_litellm(self.router.completion)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def complete(
         self,
@@ -145,7 +138,7 @@ class LLMWrapper:
         user_message: str,
         max_tokens: int = 4000,
     ) -> dict[str, Any]:
-        """Blocking call. Returns estimation text plus usage/cost/cache metadata."""
+        """Single LLM call returning a free-text answer, with exact-match cache."""
         cache_key = EstimationCache.make_key(
             system_prompt=system_prompt,
             user_message=user_message,
@@ -156,19 +149,12 @@ class LLMWrapper:
         if cached:
             return {**cached, "cache_hit": True}
 
-        bucket_key = EstimationCache.make_bucket_key(system_prompt=system_prompt, model=self.primary_model)
-        query_embedding = embed_text(user_message)
-        if query_embedding is not None:
-            semantic_hit = self.cache.get_semantic(bucket_key, query_embedding, self.semantic_cache_threshold)
-            if semantic_hit:
-                return {**semantic_hit, "cache_hit": True}
-
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
 
-        log.info("llm_call_started", mode="blocking", primary_model=self.primary_model)
+        log.info("llm_call_started", mode="blocking", model=self.primary_model)
         t0 = time.perf_counter()
         try:
             response = self.router.completion(
@@ -197,8 +183,6 @@ class LLMWrapper:
             finish_reason=result["finish_reason"],
         )
         self.cache.set(cache_key, result)
-        if query_embedding is not None:
-            self.cache.set_semantic(bucket_key, query_embedding, result, self.semantic_cache_max_entries)
         return {**result, "cache_hit": False}
 
     def complete_structured(
@@ -206,45 +190,17 @@ class LLMWrapper:
         *,
         system_prompt: str,
         user_message: str,
-        response_model: type[ResultT],
+        response_model: type[T],
         max_tokens: int = 4000,
-    ) -> dict[str, Any]:
-        """Blocking call that returns a validated instance of ``response_model``
-        instead of raw text, via Instructor. Same cache + fallback as
-        ``complete()``; the cache entry stores the validated model's dict form.
+        max_retries: int = 6,
+    ) -> tuple[T, dict[str, Any]]:
+        """Run the LLM with Instructor and return ``(model_instance, meta)``.
+
+        ``meta`` carries ``model``, ``provider``, ``cost_usd`` and ``latency_ms``
+        so the caller can report what the call actually cost. Instructor
+        re-prompts the LLM up to ``max_retries`` times when a Pydantic validator
+        raises, feeding the ``ValueError`` message back to the model.
         """
-        cache_key = EstimationCache.make_key(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            model=self.primary_model,
-            max_tokens=max_tokens,
-            response_model=response_model.__name__,
-        )
-        cached = self.cache.get(cache_key)
-        if cached:
-            return {
-                "result": response_model.model_validate(cached["result"]),
-                "model": cached["model"],
-                "provider": cached["provider"],
-                "cost_usd": cached.get("cost_usd", 0.0),
-                "cache_hit": True,
-            }
-
-        bucket_key = EstimationCache.make_bucket_key(
-            system_prompt=system_prompt, model=self.primary_model, response_model=response_model.__name__
-        )
-        query_embedding = embed_text(user_message)
-        if query_embedding is not None:
-            semantic_hit = self.cache.get_semantic(bucket_key, query_embedding, self.semantic_cache_threshold)
-            if semantic_hit:
-                return {
-                    "result": response_model.model_validate(semantic_hit["result"]),
-                    "model": semantic_hit["model"],
-                    "provider": semantic_hit["provider"],
-                    "cost_usd": semantic_hit.get("cost_usd", 0.0),
-                    "cache_hit": True,
-                }
-
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -252,17 +208,17 @@ class LLMWrapper:
 
         log.info(
             "llm_structured_call_started",
-            mode="structured",
-            primary_model=self.primary_model,
+            model=self.primary_model,
             response_model=response_model.__name__,
         )
         t0 = time.perf_counter()
         try:
-            result, completion = self.instructor_client.chat.completions.create_with_completion(
+            result, completion = self._instructor.chat.completions.create_with_completion(
                 model="estimator",
+                messages=messages,
                 response_model=response_model,
                 max_tokens=max_tokens,
-                messages=messages,
+                max_retries=max_retries,
             )
         except Exception as exc:
             latency_ms = int((time.perf_counter() - t0) * 1000)
@@ -275,41 +231,18 @@ class LLMWrapper:
             raise
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        model = _normalise_model_name(completion.model)
-        provider = _provider_from_model(model)
-        usage = completion.usage
+        model = _normalise_model_name(getattr(completion, "model", self.primary_model))
+        usage = getattr(completion, "usage", None)
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
         output_tokens = getattr(usage, "completion_tokens", 0) or 0
-        cost_usd = _estimate_cost(model, input_tokens, output_tokens)
-
-        log.info(
-            "llm_structured_call_completed",
-            model=model,
-            provider=provider,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_usd=cost_usd,
-            latency_ms=latency_ms,
-        )
-
-        # `result` only exists here because create_with_completion() already
-        # validated it against response_model (including any model_validator) :
-        # Instructor raises and retries internally on validation failure. So
-        # both cache writes below only ever store output that already passed
-        # the output-side guardrails.
-        cache_payload = {
-            "result": result.model_dump(),
+        meta = {
             "model": model,
-            "provider": provider,
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+            "provider": _provider_from_model(model),
+            "cost_usd": _estimate_cost(model, input_tokens, output_tokens),
             "latency_ms": latency_ms,
-            "cost_usd": cost_usd,
         }
-        self.cache.set(cache_key, cache_payload)
-        if query_embedding is not None:
-            self.cache.set_semantic(bucket_key, query_embedding, cache_payload, self.semantic_cache_max_entries)
-
-        return {"result": result, "model": model, "provider": provider, "cost_usd": cost_usd, "cache_hit": False}
+        log.info("llm_structured_call_completed", **meta)
+        return result, meta
 
     def complete_stream(
         self,
@@ -322,10 +255,14 @@ class LLMWrapper:
         """Yield text chunks as they arrive. A cache hit replays the cached text
         as a single chunk so the client UX stays consistent either way.
 
-        If ``meta_holder`` is passed, it is populated in place with
-        ``cache_hit``, ``cost_usd``, ``model`` and ``provider`` once the
-        generator is exhausted : callers that need that metadata (e.g. the SSE
-        router, to emit a final event) read it after the ``for`` loop ends.
+        Only the exact-match cache applies here. The semantic cache is keyed by
+        a typed ``EstimationRequest`` (its bucket includes project type, detail
+        level and output format), which this free-text path doesn't have.
+
+        If ``meta_holder`` is passed it is populated in place with ``cache_hit``,
+        ``cost_usd``, ``model`` and ``provider`` once the generator is
+        exhausted : callers that need that metadata (e.g. the SSE router, to
+        emit a final event) read it after the ``for`` loop ends.
         """
         cache_key = EstimationCache.make_key(
             system_prompt=system_prompt,
@@ -346,28 +283,12 @@ class LLMWrapper:
             yield cached.get("estimation", "")
             return
 
-        bucket_key = EstimationCache.make_bucket_key(system_prompt=system_prompt, model=self.primary_model)
-        query_embedding = embed_text(user_message)
-        if query_embedding is not None:
-            semantic_hit = self.cache.get_semantic(bucket_key, query_embedding, self.semantic_cache_threshold)
-            if semantic_hit:
-                log.info("stream_semantic_cache_hit", chars=len(semantic_hit.get("estimation", "")))
-                if meta_holder is not None:
-                    meta_holder.update(
-                        cache_hit=True,
-                        cost_usd=semantic_hit.get("cost_usd", 0.0),
-                        model=semantic_hit.get("model", self.primary_model),
-                        provider=semantic_hit.get("provider", _provider_from_model(self.primary_model)),
-                    )
-                yield semantic_hit.get("estimation", "")
-                return
-
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
 
-        log.info("llm_stream_started", primary_model=self.primary_model)
+        log.info("llm_stream_started", model=self.primary_model)
         t0 = time.perf_counter()
         full_text: list[str] = []
         usage_chunk: Any = None
@@ -385,8 +306,8 @@ class LLMWrapper:
                 if delta:
                     full_text.append(delta)
                     yield delta
-                # The final chunk of the stream carries cumulative usage
-                # (OpenAI/Anthropic both do this via LiteLLM's stream_options).
+                # The final chunk carries cumulative usage (both providers do
+                # this via LiteLLM's stream_options).
                 if getattr(chunk, "usage", None):
                     usage_chunk = chunk.usage
                 if getattr(chunk, "model", None):
@@ -417,21 +338,27 @@ class LLMWrapper:
             cost_usd=cost_usd,
         )
 
-        stream_cache_payload = {
-            "estimation": rendered,
-            "model": model,
-            "provider": provider,
-            "finish_reason": "stop",
-            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
-            "latency_ms": latency_ms,
-            "cost_usd": cost_usd,
-        }
-        self.cache.set(cache_key, stream_cache_payload)
-        if query_embedding is not None:
-            self.cache.set_semantic(bucket_key, query_embedding, stream_cache_payload, self.semantic_cache_max_entries)
+        self.cache.set(
+            cache_key,
+            {
+                "estimation": rendered,
+                "model": model,
+                "provider": provider,
+                "finish_reason": "stop",
+                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+                "latency_ms": latency_ms,
+                "cost_usd": cost_usd,
+            },
+        )
 
         if meta_holder is not None:
-            meta_holder.update(cache_hit=False, cost_usd=cost_usd, model=model, provider=provider)
+            meta_holder.update(
+                cache_hit=False, cost_usd=cost_usd, model=model, provider=provider
+            )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _normalise_response(response: Any, *, latency_ms: int) -> dict[str, Any]:

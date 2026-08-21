@@ -35,10 +35,15 @@ services:
       retries: 3
 
   redis:
-    image: redis:7-alpine
+    # Redis Stack bundles the RediSearch module that redisvl uses for the
+    # semantic cache's vector similarity queries. The vanilla ``redis:7-alpine``
+    # image does NOT ship it: the app still runs, but the semantic cache
+    # disables itself at startup and only the exact-match layer works.
+    image: redis/redis-stack:7.4.0-v0
     container_name: cag-estimator-redis
     ports:
       - "6379:6379"
+      - "8001:8001"  # RedisInsight UI
     volumes:
       - redis_data:/data
     healthcheck:

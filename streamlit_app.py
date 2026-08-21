@@ -1,21 +1,21 @@
-# Streamlit UI for the estimator.
-#
-# Streamlit is a pure HTTP client of the FastAPI service now: it POSTs to
-# /api/v1/estimate/stream (free-text chat) and /api/v2/estimate (structured
-# form) and renders whatever comes back. It no longer holds an LLM API key or
-# calls OpenAI/Anthropic directly : the API owns the cache, the provider
-# fallback and the system prompt dispatch.
-#
-# Two tabs, two endpoints:
-# - "Chat" : the original free-text SSE chat against /api/v1/estimate/stream.
-# - "Structured Estimate" : an st.form building an EstimationRequest-shaped
-#   JSON (description/project_type/detail_level/output_format) posted to
-#   /api/v2/estimate, which returns a validated EstimationResult (phases,
-#   totals, confidence) instead of free text.
-#
-# The system prompt and CAG examples shown in the sidebar are built locally
-# purely for display (no LLM call involved), from the same functions the API
-# uses, so what you see is guaranteed to match what the API actually sends.
+"""Streamlit UI for the estimator.
+
+Streamlit acts as a pure HTTP client of the FastAPI service. It holds no LLM API
+key and never calls a provider directly — the API owns the guardrails, the
+caches, the prompt versioning and the provider fallback. Two tabs, two flows:
+
+- **Structured estimate**: a typed ``EstimationRequest`` to
+  ``POST /api/v1/estimate``, rendering the validated ``EstimationResult``.
+- **Chat**: a free-text transcription streamed from
+  ``POST /api/v1/estimate/stream`` and rendered token by token.
+
+The prompt version is deliberately NOT surfaced: which template the service
+runs is a deploy-time decision (``PROMPT_VERSION`` in settings), not something
+the person asking for an estimate should have to reason about. It is still
+logged and returned in the API response for traceability.
+"""
+
+from __future__ import annotations
 
 import json
 import time
@@ -25,68 +25,99 @@ import streamlit as st
 
 from app.config import get_settings
 from app.context.examples import ESTIMATION_EXAMPLES, format_examples
-from app.schemas import DetailLevel, OutputFormat, ProjectType
+from app.schemas.estimation import DetailLevel, OutputFormat, ProjectType
 from app.services.llm_service import build_system_prompt
 
 settings = get_settings()
-STREAM_ENDPOINT = f"{settings.ESTIMATOR_API_BASE_URL.rstrip('/')}/api/v1/estimate/stream"
-STRUCTURED_ENDPOINT = f"{settings.ESTIMATOR_API_BASE_URL.rstrip('/')}/api/v2/estimate"
+API_BASE = settings.ESTIMATOR_API_BASE_URL.rstrip("/")
+ESTIMATE_ENDPOINT = f"{API_BASE}/api/v1/estimate"
+STREAM_ENDPOINT = f"{API_BASE}/api/v1/estimate/stream"
 
-MIN_MESSAGE_LENGTH = 50
 MIN_DESCRIPTION_LENGTH = 20
+MIN_TRANSCRIPTION_LENGTH = 50
 
-system_prompt = build_system_prompt()
-examples_text = format_examples(ESTIMATION_EXAMPLES)
+st.set_page_config(page_title="Software Estimator", page_icon="📊")
+st.title("Software Estimator")
+st.caption(
+    "Describe a software project and get a phase-by-phase estimate with costs, "
+    "duration and a confidence score."
+)
 
-def format_rejection_message(detail) -> str:
-    """Turn an API rejection into a message fit for the end user.
 
-    - Our own guardrail errors (400/502) already send a plain, user-facing
-      string as `detail` : shown as-is.
-    - FastAPI's built-in validation errors (422) send a list of technical
-      dicts (field/type/msg) : translated into a short, readable sentence.
+def humanise(value: str) -> str:
+    return value.replace("_", " ").capitalize()
+
+
+def describe_rejection(payload: object, status_code: int) -> str:
+    """Turn an API error body into a message fit for the end user.
+
+    - Guardrail rejections (400) arrive as ``{"reason": ..., "message": ...}``.
+    - FastAPI validation errors (422) arrive as a list of technical dicts.
+    - Anything else falls back to the raw text.
     """
-    if isinstance(detail, list):
-        field_names = {"transcription": "your message", "description": "the project description"}
+    if isinstance(payload, dict) and "message" in payload:
+        labels = {
+            "prompt_injection": "That looks like an attempt to instruct the AI rather "
+            "than describe a project.",
+            "pii": "Please remove personal data from the description.",
+            "moderation": "That content can't be processed.",
+        }
+        prefix = labels.get(str(payload.get("reason")), "")
+        return f"{prefix} {payload['message']}".strip()
+    if isinstance(payload, list):
         parts = []
-        for err in detail:
+        for err in payload:
             loc = err.get("loc", [])
-            field = field_names.get(loc[-1], loc[-1]) if loc else "your input"
-            parts.append(f"{field} : {err.get('msg', 'is invalid')}")
-        return "Please check your message: " + "; ".join(parts) + "."
-    return str(detail)
+            field = humanise(str(loc[-1])) if loc else "Input"
+            parts.append(f"{field}: {err.get('msg', 'is invalid')}")
+        return "Please check the form — " + "; ".join(parts) + "."
+    return f"The service returned an error ({status_code})."
+
+
+def request_estimation(payload: dict) -> dict:
+    """POST to the estimate endpoint, raising RuntimeError with a friendly
+    message on any rejection (400 guardrail, 422 validation, 502 upstream)."""
+    response = httpx.post(
+        ESTIMATE_ENDPOINT, json=payload, timeout=httpx.Timeout(180.0, connect=10.0)
+    )
+    if response.status_code >= 400:
+        try:
+            detail = response.json().get("detail", response.text)
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(describe_rejection(detail, response.status_code))
+    return response.json()
+
 
 def stream_estimation(transcription: str, meta_holder: dict):
     """POST to the SSE endpoint and yield text chunks as they arrive.
 
-    Per the SSE spec, a message can carry multiple `data:` lines that must be
-    joined with `\\n` to reconstruct the payload, and a blank line terminates
-    the message. Line endings vary by server (`\\n` vs `\\r\\n`), so both are
-    accepted. The final `meta` event (cache hit, cost, model) is parsed into
-    ``meta_holder`` instead of being yielded as chat text.
+    Per the SSE spec a message can carry multiple ``data:`` lines that must be
+    joined with a newline, and a blank line terminates the message. The final
+    ``meta`` event (cache hit, cost, model) is parsed into ``meta_holder``
+    rather than yielded as chat text.
     """
-    payload = {"transcription": transcription}
     with httpx.stream(
         "POST",
         STREAM_ENDPOINT,
-        json=payload,
-        timeout=httpx.Timeout(120.0, connect=10.0),
+        json={"transcription": transcription},
+        timeout=httpx.Timeout(180.0, connect=10.0),
         headers={"Accept": "text/event-stream"},
     ) as response:
         if response.status_code >= 400:
-            # Must read the body here, while the stream is still open : once
-            # this `with` block exits (e.g. the exception propagating out),
-            # httpx closes the underlying stream and reading it afterwards
-            # raises StreamClosed. Bake the message into a plain exception
-            # instead of re-raising response.raise_for_status()'s.
+            # Read the body here, while the stream is still open: once this
+            # `with` block exits httpx closes the stream and reading it
+            # afterwards raises StreamClosed. Bake the message into a plain
+            # exception rather than re-raising raise_for_status()'s.
             response.read()
             try:
                 detail = response.json().get("detail", response.text)
             except ValueError:
                 detail = response.text
-            raise RuntimeError(format_rejection_message(detail))
+            raise RuntimeError(describe_rejection(detail, response.status_code))
+
         current_event = "token"
-        data_lines = []
+        data_lines: list[str] = []
         for raw_line in response.iter_lines():
             if raw_line == "":
                 if data_lines:
@@ -105,69 +136,110 @@ def stream_estimation(transcription: str, meta_holder: dict):
             if raw_line.startswith("event:"):
                 current_event = raw_line[6:].strip()
             elif raw_line.startswith("data:"):
-                data_lines.append(raw_line[6:] if raw_line.startswith("data: ") else raw_line[5:])
+                data_lines.append(
+                    raw_line[6:] if raw_line.startswith("data: ") else raw_line[5:]
+                )
 
-def submit_structured_estimate(payload: dict) -> dict:
-    """POST to /api/v2/estimate (blocking, no streaming) and return the
-    parsed EstimationResponse JSON, or raise RuntimeError with a friendly
-    message on any rejection (422 validation, 400 guardrail, 502 model)."""
-    response = httpx.post(
-        STRUCTURED_ENDPOINT,
-        json=payload,
-        timeout=httpx.Timeout(120.0, connect=10.0),
-    )
-    if response.status_code >= 400:
-        try:
-            detail = response.json().get("detail", response.text)
-        except ValueError:
-            detail = response.text
-        raise RuntimeError(format_rejection_message(detail))
-    return response.json()
 
-with st.sidebar:
-    st.header("CAG Context")
+form_tab, chat_tab = st.tabs(["Structured estimate", "Chat"])
 
-    with st.expander("System Prompt"):
-        st.text_area("System Prompt", value=system_prompt, height=300, disabled=True, label_visibility="collapsed")
+with form_tab:
+    with st.form("estimation_form"):
+        description = st.text_area(
+            "Project description",
+            height=200,
+            placeholder="Describe the project: goals, key features, constraints…",
+            help=f"At least {MIN_DESCRIPTION_LENGTH} characters.",
+        )
+        project_type = st.selectbox(
+            "Project type", options=list(ProjectType), format_func=lambda v: humanise(v.value)
+        )
+        detail_level = st.radio(
+            "Detail level",
+            options=list(DetailLevel),
+            index=1,
+            horizontal=True,
+            format_func=lambda v: humanise(v.value),
+        )
+        output_format = st.selectbox(
+            "Output format", options=list(OutputFormat), format_func=lambda v: humanise(v.value)
+        )
+        submitted = st.form_submit_button("Generate estimation", type="primary")
 
-    with st.expander("Injected Examples"):
-        st.text_area("Injected Examples", value=examples_text, height=300, disabled=True, label_visibility="collapsed")
+    if submitted:
+        if len(description.strip()) < MIN_DESCRIPTION_LENGTH:
+            st.error(
+                f"The description is too short ({len(description.strip())} characters). "
+                f"Please describe the project in at least {MIN_DESCRIPTION_LENGTH} characters."
+            )
+        else:
+            started = time.perf_counter()
+            try:
+                with st.spinner("Estimating…"):
+                    body = request_estimation(
+                        {
+                            "description": description.strip(),
+                            "project_type": project_type.value,
+                            "detail_level": detail_level.value,
+                            "output_format": output_format.value,
+                        }
+                    )
+            except RuntimeError as exc:
+                st.error(str(exc))
+            except httpx.HTTPError as exc:
+                st.error(f"Could not reach the estimator at `{ESTIMATE_ENDPOINT}`: {exc}")
+            else:
+                elapsed = round(time.perf_counter() - started, 2)
+                result = body["result"]
 
-    st.header("Service")
-    st.code(STREAM_ENDPOINT, language="text")
-    st.code(STRUCTURED_ENDPOINT, language="text")
-    st.markdown(f"**Primary model:** `{settings.PRIMARY_MODEL}`")
-    st.markdown(f"**Fallback model:** `{settings.FALLBACK_MODEL}`")
-    st.markdown(f"**Cache TTL:** `{settings.CACHE_TTL}s`")
+                # The service normalises anything it could not size confidently
+                # into a summary starting with "Out of scope:" — show that as a
+                # warning rather than dressing a non-estimate up as a real one.
+                if result["summary"].startswith("Out of scope:"):
+                    st.warning(result["summary"])
+                else:
+                    st.success(result["summary"])
 
-    st.header("Last Call Metrics")
-    last_call = st.session_state.get("last_call")
-    if last_call:
-        st.metric("Response time (s)", f"{last_call['elapsed']:.2f}")
-        # Costs are tiny (fractions of a cent) : st.metric would otherwise
-        # round a raw float like 0.000385 down to "$0.00". Format explicitly.
-        st.metric("Estimated cost (USD)", f"${last_call.get('cost_usd', 0.0):.6f}")
-        st.metric("Cache hit", "Yes" if last_call.get("cache_hit") else "No")
-        if last_call.get("model"):
-            st.caption(f"Answered by `{last_call['model']}` ({last_call.get('provider', 'unknown')})")
-    else:
-        st.caption("No calls made yet.")
+                    left, middle, right = st.columns(3)
+                    left.metric("Total duration", f"{result['total_duration_weeks']} weeks")
+                    middle.metric("Total cost", f"€{result['total_cost_eur']:,}")
+                    right.metric("Confidence", f"{result['confidence_pct']}%")
 
-chat_tab, form_tab = st.tabs(["Chat", "Structured Estimate"])
+                    st.subheader("Phases")
+                    st.table(
+                        [
+                            {
+                                "Phase": phase["name"],
+                                "Duration (weeks)": phase["duration_weeks"],
+                                "Cost (EUR)": f"€{phase['cost_eur']:,}",
+                                "Detail": phase["summary"],
+                            }
+                            for phase in result["phases"]
+                        ]
+                    )
+
+                st.session_state.last_call = {
+                    "elapsed": elapsed,
+                    "cached": body.get("cached", False),
+                    **body.get("meta", {}),
+                }
 
 with chat_tab:
-    # Set Up history in session_state
+    st.caption(
+        "Paste a client-meeting transcription and get a free-text estimation "
+        "streamed token by token. Same guardrails and cache as the form."
+    )
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Render actual history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # User input
-    if prompt := st.chat_input(f"Describe your software project (min {MIN_MESSAGE_LENGTH} characters)..."):
-        # Show users message
+    if prompt := st.chat_input(
+        f"Describe your project (min {MIN_TRANSCRIPTION_LENGTH} characters)…"
+    ):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -177,122 +249,80 @@ with chat_tab:
 
             # Fast client-side check: no point round-tripping to the API (and
             # eventually the LLM) for something we already know is too short.
-            if len(prompt) < MIN_MESSAGE_LENGTH:
-                full_response = (
+            if len(prompt) < MIN_TRANSCRIPTION_LENGTH:
+                answer = (
                     f"Your message is too short ({len(prompt)} characters). Please "
-                    f"describe your project in at least {MIN_MESSAGE_LENGTH} "
+                    f"describe your project in at least {MIN_TRANSCRIPTION_LENGTH} "
                     "characters so there's enough to estimate."
                 )
-                placeholder.error(full_response)
-                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                placeholder.error(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
                 st.stop()
 
-            full_response = ""
-            meta_holder = {}
-            start_time = time.time()
+            answer = ""
+            meta_holder: dict = {}
+            started = time.perf_counter()
             try:
                 for chunk in stream_estimation(prompt, meta_holder):
-                    full_response += chunk
-                    placeholder.markdown(full_response + "▍")
-                placeholder.markdown(full_response)
+                    answer += chunk
+                    placeholder.markdown(answer + "▍")
+                placeholder.markdown(answer)
             except RuntimeError as exc:
-                # The API rejected the request (e.g. 422 validation, 400 guardrail,
-                # 502 model failure) : surface its actual detail, not a generic
-                # "connection failed" message.
-                full_response = str(exc)
-                placeholder.error(full_response)
+                answer = str(exc)
+                placeholder.error(answer)
             except httpx.HTTPError as exc:
-                full_response = f"Could not reach the estimator at `{STREAM_ENDPOINT}`: {exc}"
-                placeholder.error(full_response)
-            elapsed = round(time.time() - start_time, 2)
+                answer = f"Could not reach the estimator at `{STREAM_ENDPOINT}`: {exc}"
+                placeholder.error(answer)
+            elapsed = round(time.perf_counter() - started, 2)
 
-        st.session_state.messages.append({"role": "assistant", "content": full_response})
+        st.session_state.messages.append({"role": "assistant", "content": answer})
         st.session_state.last_call = {
             "elapsed": elapsed,
+            "cached": meta_holder.get("cache_hit", False),
             "cost_usd": meta_holder.get("cost_usd", 0.0),
-            "cache_hit": meta_holder.get("cache_hit", False),
             "model": meta_holder.get("model"),
             "provider": meta_holder.get("provider"),
         }
         st.rerun()
 
-with form_tab:
-    st.caption(
-        "Structured request against /api/v2/estimate: the same guardrails and "
-        "cache apply, but the response is a validated EstimationResult "
-        "(phases, totals, confidence) instead of free text."
-    )
+with st.sidebar:
+    st.header("Service")
+    st.code(ESTIMATE_ENDPOINT, language="text")
+    st.code(STREAM_ENDPOINT, language="text")
+    st.markdown(f"**Primary model:** `{settings.PRIMARY_MODEL}`")
+    st.markdown(f"**Fallback model:** `{settings.FALLBACK_MODEL}`")
+    st.markdown(f"**Cache TTL:** `{settings.CACHE_TTL}s`")
 
-    with st.form("structured_estimate_form"):
-        description = st.text_area(
-            "Project description",
-            height=140,
-            placeholder=f"Describe the project (min {MIN_DESCRIPTION_LENGTH} characters)...",
+    st.header("CAG Context")
+    with st.expander("Chat system prompt"):
+        st.text_area(
+            "Chat system prompt",
+            value=build_system_prompt(),
+            height=260,
+            disabled=True,
+            label_visibility="collapsed",
         )
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            project_type = st.selectbox(
-                "Project type", options=list(ProjectType), format_func=lambda v: v.value.replace("_", " ").title()
-            )
-        with col2:
-            detail_level = st.selectbox(
-                "Detail level", options=list(DetailLevel), format_func=lambda v: v.value.title()
-            )
-        with col3:
-            output_format = st.selectbox(
-                "Output format", options=list(OutputFormat), format_func=lambda v: v.value.replace("_", " ").title()
-            )
-        submitted = st.form_submit_button("Get estimate")
+    with st.expander("Injected examples"):
+        st.text_area(
+            "Injected examples",
+            value=format_examples(ESTIMATION_EXAMPLES),
+            height=260,
+            disabled=True,
+            label_visibility="collapsed",
+        )
 
-    if submitted:
-        if len(description) < MIN_DESCRIPTION_LENGTH:
-            st.error(
-                f"Your description is too short ({len(description)} characters). "
-                f"Please describe the project in at least {MIN_DESCRIPTION_LENGTH} characters."
+    st.header("Last Call")
+    last_call = st.session_state.get("last_call")
+    if last_call:
+        st.metric("Response time (s)", f"{last_call['elapsed']:.2f}")
+        st.metric("Served from cache", "Yes" if last_call.get("cached") else "No")
+        # Costs are fractions of a cent : st.metric would round 0.000385 to
+        # "$0.00", so format explicitly. A cache hit genuinely costs nothing.
+        st.metric("Cost (USD)", f"${last_call.get('cost_usd', 0.0):.6f}")
+        if last_call.get("model"):
+            st.caption(
+                f"Answered by `{last_call['model']}` "
+                f"({last_call.get('provider', 'unknown')})"
             )
-        else:
-            payload = {
-                "description": description,
-                "project_type": project_type.value,
-                "detail_level": detail_level.value,
-                "output_format": output_format.value,
-            }
-            start_time = time.time()
-            try:
-                with st.spinner("Estimating..."):
-                    data = submit_structured_estimate(payload)
-                elapsed = round(time.time() - start_time, 2)
-                result = data["result"]
-
-                st.success(result["summary"])
-                metric_col1, metric_col2, metric_col3 = st.columns(3)
-                metric_col1.metric("Total duration", f"{result['total_duration_weeks']} weeks")
-                metric_col2.metric("Total cost", f"€{result['total_cost_eur']:,}")
-                metric_col3.metric("Confidence", f"{result['confidence_pct']}%")
-
-                if result["phases"]:
-                    st.table(
-                        [
-                            {
-                                "Phase": phase["name"],
-                                "Duration (weeks)": phase["duration_weeks"],
-                                "Cost (EUR)": phase["cost_eur"],
-                                "Confidence (%)": phase["confidence_pct"],
-                                "Assumptions": "; ".join(phase["assumptions"]),
-                            }
-                            for phase in result["phases"]
-                        ]
-                    )
-
-                st.caption(f"Prompt version `{data['prompt_version']}` : answered in {elapsed}s")
-                st.session_state.last_call = {
-                    "elapsed": elapsed,
-                    "cost_usd": 0.0,
-                    "cache_hit": False,
-                    "model": None,
-                    "provider": None,
-                }
-            except RuntimeError as exc:
-                st.error(str(exc))
-            except httpx.HTTPError as exc:
-                st.error(f"Could not reach the estimator at `{STRUCTURED_ENDPOINT}`: {exc}")
+    else:
+        st.caption("No estimations yet.")

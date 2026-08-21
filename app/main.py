@@ -4,9 +4,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from scalar_fastapi import get_scalar_api_reference
+from scalar_fastapi import AgentScalarConfig, get_scalar_api_reference
 from app.config import get_settings
-from app.routers import estimation_v2, estimations
+from app.routers import estimations, estimations_text
 
 
 def configure_logging() -> None:
@@ -46,7 +46,13 @@ async def lifespan(app: FastAPI):
     configure_logging()
     log = structlog.get_logger()
     settings = get_settings()
-    log.info("application_started", environment=settings.APP_ENV, primary_model=settings.PRIMARY_MODEL, fallback_model=settings.FALLBACK_MODEL)
+    log.info(
+        "application_started",
+        environment=settings.APP_ENV,
+        primary_model=settings.PRIMARY_MODEL,
+        fallback_model=settings.FALLBACK_MODEL,
+        prompt_version=settings.PROMPT_VERSION,
+    )
     yield
     log.info("application_shutdown")
 
@@ -68,13 +74,16 @@ app.add_middleware(
 )
 
 app.include_router(estimations.router)
-app.include_router(estimation_v2.router)
+app.include_router(estimations_text.router)
 
 @app.get("/docs", include_in_schema=False)
 async def scalar_docs():
     return get_scalar_api_reference(
         openapi_url=app.openapi_url,
-        title=app.title
+        title=app.title,
+        telemetry=False,
+        agent=AgentScalarConfig(disabled=True),
+        overrides={"mcp": {"disabled": True}},
     )
 
 @app.get("/health", tags=["health"])

@@ -1,15 +1,21 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import model_validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
+    """Application settings loaded from environment variables and .env file."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+    )
+
     OPENAI_API_KEY: str | None = None
     ANTHROPIC_API_KEY: str | None = None
-    LLM_PROVIDER: str = "openai"
-    LLM_MODEL: str = "gpt-4o-mini"
-    APP_ENV: str = "development"
-    LOG_LEVEL: str = "DEBUG"
+    APP_ENV: Literal["development", "staging", "production"] = "development"
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "DEBUG"
 
     # LiteLLM wrapper: tries PRIMARY_MODEL first, falls back to FALLBACK_MODEL
     # (same or different provider) on failure.
@@ -18,29 +24,20 @@ class Settings(BaseSettings):
     LLM_TIMEOUT: int = 30
     LLM_RETRIES: int = 2
 
-    # Redis exact-match cache
+    PROMPT_VERSION: str = "v1"
+
     REDIS_URL: str = "redis://localhost:6379"
     CACHE_TTL: int = 86400
 
-    # Semantic cache: on an exact-match miss, embed the message and look for a
-    # prior response above this cosine-similarity threshold within the same
-    # bucket (same system prompt + model). OpenAI-only, like moderation: with
-    # no OPENAI_API_KEY it silently no-ops and only the exact-match cache runs.
+    # Semantic cache (requires Redis Stack for the RediSearch module).
     EMBEDDING_MODEL: str = "text-embedding-3-small"
-    # 0.80, not 0.92: calibrated live against text-embedding-3-small, where a
-    # genuine paraphrase of the same project lands around 0.81 cosine
-    # similarity (not 0.92+ as a naive "1 - distance_threshold" conversion
-    # from other similarity spaces would suggest), while an unrelated project
-    # in the same bucket lands around 0.33-0.60. 0.80 catches the paraphrase
-    # with a wide safety margin above both negative cases.
-    SEMANTIC_CACHE_THRESHOLD: float = 0.80
-    SEMANTIC_CACHE_MAX_ENTRIES: int = 200
+    SEMANTIC_CACHE_THRESHOLD: float = 0.85
+    SEMANTIC_CACHE_TTL: int = 86400
+    # When True, the semantic cache LOGS potential hits but does NOT serve them.
+    # Used to gather metrics before flipping the cache on in production.
+    SEMANTIC_CACHE_LOG_ONLY: bool = False
 
-    # Base URL the Streamlit client uses to reach this API
     ESTIMATOR_API_BASE_URL: str = "http://localhost:8000"
-
-    class Config:
-        env_file = ".env"
 
     @model_validator(mode="after")
     def validate_at_least_one_api_key(self) -> "Settings":
@@ -53,6 +50,8 @@ class Settings(BaseSettings):
             )
         return self
 
+
 @lru_cache
 def get_settings() -> Settings:
+    """Return cached application settings (singleton)."""
     return Settings()

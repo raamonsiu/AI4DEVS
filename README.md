@@ -11,13 +11,24 @@
 
 API for software project estimation using LLMs, based on a CAG (Context-Augmented Generation) architecture: historical estimation examples are injected into the prompt to guide the model toward more accurate and consistent budgets.
 
-Every LLM call goes through a [LiteLLM](https://docs.litellm.ai/)-backed wrapper that adds:
-- **Provider fallback** : tries `PRIMARY_MODEL` first (OpenAI by default), retries it a few times, then falls over to `FALLBACK_MODEL` (Anthropic by default) so a single expired key, rate limit, or outage doesn't take the whole feature down.
-- **Two-layer Redis cache** : an exact-match layer (same system prompt, question, model and `max_tokens`, question normalized before hashing) is checked first; on a miss, a semantic layer embeds the question (OpenAI `text-embedding-3-small`) and looks for a prior response above a cosine-similarity threshold within the same system-prompt/model bucket, catching paraphrases and typos the exact layer can't. Input guardrails always run before either cache layer, and a response is only written to cache after it passes output validation.
-- **Structured logging** : every phase of a call (cache check, dispatch, retry, fallback, success/failure) is logged via `structlog`, so a single request can be traced end-to-end.
-- **Input guardrails** : every request is checked for prompt-injection patterns, off-topic content (a cheap LLM-based topic classifier), and OpenAI moderation flags before it reaches the estimation prompt. A rejection returns `400` with a plain, user-facing message.
+A typed request (`description` + project type / detail level / output format) maps to a typed, validated `EstimationResult` — phases, totals and a confidence score — via [Instructor](https://python.useinstructor.com/) + Pydantic. The whole pipeline lives in a single service class, `app/services/estimation.py`:
 
-Streamlit is a thin HTTP client of the API (not a second place that talks to the LLM directly), with two tabs: **Chat**, which POSTs to `/api/v1/estimate/stream` and renders the response as it streams in, and **Structured Estimate**, an `st.form` that POSTs to `/api/v2/estimate` and renders the validated, phase-by-phase result.
+1. **Input guardrails** — moderation, prompt-injection regex, PII heuristics.
+2. **Exact-match cache** lookup (Redis).
+3. **Semantic cache** lookup (embedding similarity, Redis Stack + redisvl).
+4. **Render** the versioned Jinja2 prompt.
+5. **LLM call** via Instructor, re-prompting on validator failures.
+6. **Output guardrail** — normalise low-confidence answers into an explicit "Out of scope:" response.
+7. **Write both caches** — only after the output passed validation.
+
+Order matters: guardrails run *before* any cache so a malicious or PII description can never be served from cache, and both cache writes happen *after* output validation so a bad estimation is never persisted and replayed for the whole TTL.
+
+Every LLM call goes through a [LiteLLM](https://docs.litellm.ai/)-backed wrapper that adds:
+- **Provider fallback** — tries `PRIMARY_MODEL` first (OpenAI by default), retries it, then falls over to `FALLBACK_MODEL` (Anthropic by default) so an expired key, rate limit or outage doesn't take the feature down. Structured calls go through the same Router, so they keep the fallback guarantee.
+- **Cost tracking** — every response reports the model, provider, latency and USD cost of that call. A cache hit reports `cost_usd: 0.0`, because nothing was spent.
+- **Structured logging** — every phase of a call (guardrails, cache check, prompt render, dispatch, retry, fallback, success/failure) is logged via `structlog`, so a request can be traced end-to-end.
+
+Streamlit is a thin HTTP client of the API (not a second place that talks to the LLM), with two tabs: a **structured estimate** form that POSTs an `EstimationRequest` and renders the validated result, and a **chat** that streams a free-text estimation from the SSE endpoint.
 
 ## Project Structure
 ```
@@ -26,29 +37,33 @@ cag-estimator/
 │   ├── main.py             -- FastAPI app entrypoint
 │   ├── config.py           -- Settings loaded from .env
 │   ├── constants.py        -- Model pricing table
-│   ├── dependencies.py     -- Shared singletons (cache, LLM wrapper)
-│   ├── routers/            -- Endpoint handlers
-│   │   ├── estimations.py      -- v1: free-text estimation (blocking + SSE)
-│   │   └── estimation_v2.py    -- v2: structured estimation (schema in/out)
-│   ├── services/           -- LLM calls and business logic
-│   │   ├── llm_service.py      -- Prompt building + orchestration (v1)
-│   │   ├── llm_wrapper.py      -- LiteLLM fallback, cache, cost tracking
-│   │   ├── cache.py            -- Redis cache: exact-match + semantic layers
-│   │   ├── embeddings.py       -- Embedding client for the semantic cache
-│   │   ├── guardrails.py       -- Input guardrails (injection, topic, moderation)
-│   │   └── evaluation.py
-│   ├── prompts/             -- Jinja2-templated, versioned prompts (v2)
+│   ├── dependencies.py     -- Shared singletons (caches, wrapper, service)
+│   ├── routers/
+│   │   ├── estimations.py      -- POST /api/v1/estimate (HTTP error mapping only)
+│   │   └── estimations_text.py -- Free-text endpoints: /estimate/text, /estimate/stream
+│   ├── services/
+│   │   ├── estimation.py       -- EstimationService: the structured pipeline
+│   │   ├── llm_service.py      -- Free-text prompt building + orchestration
+│   │   ├── evaluation.py       -- Static structural scoring of free-text output
+│   │   ├── llm_wrapper.py      -- LiteLLM fallback, Instructor, streaming, cost
+│   │   └── cache.py            -- Exact-match Redis cache
+│   ├── cache/
+│   │   └── semantic.py         -- Vector-similarity cache (redisvl + Redis Stack)
+│   ├── guardrails/
+│   │   ├── input.py            -- Moderation, prompt injection, PII (exception policy)
+│   │   └── output.py           -- enforce_scope_response (filter policy)
+│   ├── prompts/
 │   │   ├── loader.py            -- render_estimation_prompt(request, version)
-│   │   └── estimation/
-│   │       ├── v1/                  -- system.j2, user.j2, examples.j2
-│   │       └── v2/                  -- risk-first variant, own examples
-│   ├── context/            -- CAG reference data (v1)
-│   │   └── examples.py
-│   └── schemas/            -- Request/response schemas
-│       ├── estimations.py      -- v1: transcription-based
-│       └── estimation.py       -- v2: description + enums, structured result
-├── streamlit_app.py         -- Streamlit UI: Chat (v1) + Structured Estimate (v2) tabs
+│   │   └── estimation/v1/       -- system.j2, user.j2, examples.j2
+│   ├── context/
+│   │   └── examples.py         -- CAG reference examples for the free-text flow
+│   └── schemas/
+│       ├── estimation.py       -- Structured: Request, Draft, Result, Response
+│       └── estimations.py      -- Free-text: transcription in, Markdown + evaluation out
+├── streamlit_app.py         -- Streamlit UI: structured form + streaming chat
+├── tests/
 ├── .env.example
+├── docker-compose.yml
 ├── pyproject.toml
 └── README.md
 ```
@@ -56,144 +71,123 @@ cag-estimator/
 ## Requirements
 - Python >= 3.12
 - [uv](https://docs.astral.sh/uv/)
-- Redis (used by both cache layers; `docker compose up` starts one automatically)
-- At least one of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` : the app validates this at startup and refuses to boot without one
+- **Redis Stack** — the semantic cache needs the RediSearch module for vector queries. `docker compose up` starts `redis/redis-stack` automatically. On vanilla `redis:7-alpine` the app still runs, but the semantic cache disables itself at startup (logged as `semantic_cache_disabled`) and only the exact-match layer works.
+- At least one of `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` — the app validates this at startup and refuses to boot without one. `OPENAI_API_KEY` is additionally required for the moderation guardrail and the semantic cache's embeddings.
 
 ## Setup
 ```bash
-# Install dependencies
 uv sync
-
-# Copy the environment file and fill in your API key(s)
-cp .env.example .env
+cp .env.example .env   # then fill in your API key(s)
 ```
 
 ## Running the API
 ```bash
 uv run uvicorn app.main:app --reload
 ```
-
-The API will be available at `http://127.0.0.1:8000`. Interactive docs at `/docs`. Requires a Redis instance reachable at `REDIS_URL` (defaults to `redis://localhost:6379`) : run one locally with `docker run -p 6379:6379 redis:7-alpine` if you're not using `docker compose`.
+Available at `http://127.0.0.1:8000`, interactive docs at `/docs`. Needs Redis reachable at `REDIS_URL` — start one with `docker run -p 6379:6379 redis/redis-stack:7.4.0-v0` if you're not using `docker compose`.
 
 ### Running with Docker
 ```bash
 docker compose up --build
 ```
-This also starts a `redis` service and points the API at it automatically.
+Starts the API plus a Redis Stack service (RedisInsight UI on port 8001) and wires them together.
 
 ## Running the Streamlit UI
 ```bash
 uv run streamlit run streamlit_app.py
 ```
-
-Streamlit talks to the API over HTTP at `ESTIMATOR_API_BASE_URL` (from the same `.env`) : it holds no LLM API key and never calls a provider directly. It has two tabs:
-- **Chat** : free-text SSE chat against `/api/v1/estimate/stream`, with client-side length checks and friendly errors for guardrail rejections.
-- **Structured Estimate** : an `st.form` (description + project type/detail level/output format) against `/api/v2/estimate`, rendering the validated result as summary, totals and a phase table.
-
-Its sidebar shows:
-- The active system prompt and injected CAG examples (read-only, built locally for display only)
-- The configured primary/fallback model and cache TTL
-- Response time for the last call
+It talks to the API over HTTP at `ESTIMATOR_API_BASE_URL` and holds no LLM API key. Two tabs: **Structured estimate** (the form) and **Chat** (free-text, streamed). The sidebar shows the configured models and cache TTL, the chat's system prompt and injected CAG examples (read-only, for visibility), and for the last call: response time, whether it was served from cache, the USD cost, and which model answered.
 
 ## Environment Variables
-See [`.env.example`](.env.example) for the full list of variables and their possible values.
+See [`.env.example`](.env.example) for the full list. Beyond the API keys and models:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `PROMPT_VERSION` | `v1` | Which template under `app/prompts/estimation/` is served |
+| `CACHE_TTL` | `86400` | Exact-match cache TTL, in seconds |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Embeddings for the semantic cache |
+| `SEMANTIC_CACHE_THRESHOLD` | `0.85` | Minimum cosine similarity to serve a semantic hit |
+| `SEMANTIC_CACHE_LOG_ONLY` | `false` | Log would-be hits without serving them (threshold calibration) |
 
 ## Endpoints
 
-| Method | Path                                    | Description                                        |
-|--------|------------------------------------------|-----------------------------------------------------|
-| GET    | `/health`                                | Health check                                         |
-| POST   | `/api/v1/estimate`                       | Free-text project estimation (blocking)              |
-| POST   | `/api/v1/estimate/stream`                | Free-text project estimation (Server-Sent Events)    |
-| POST   | `/api/v2/estimate?prompt_version=v1\|v2` | Structured project estimation (schema in/out)        |
+| Method | Path                        | Description                                             |
+|--------|-----------------------------|---------------------------------------------------------|
+| GET    | `/health`                   | Health check                                            |
+| POST   | `/api/v1/estimate`          | Structured estimation (typed in, validated schema out)  |
+| POST   | `/api/v1/estimate/text`     | Free-text estimation (transcription in, Markdown out)   |
+| POST   | `/api/v1/estimate/stream`   | Free-text estimation streamed over Server-Sent Events   |
+
+The structured endpoint is the main one: typed request, validated `EstimationResult`, both cache layers. The two free-text endpoints take a raw meeting transcription and return Markdown — they share the same input guardrails, wrapper and exact-match cache, but not the semantic cache (whose bucket is keyed on the typed form options a free-text request doesn't have). `/estimate/text` also runs a static structural evaluation of the generated Markdown (`app/services/evaluation.py`); `/estimate/stream` is what the Streamlit chat consumes.
 
 ### `POST /api/v1/estimate`
 
 **Request body:**
 ```json
 {
-  "transcription": "Client meeting summary describing the project..."
+  "description": "A small B2B SaaS to manage employee equipment loans across teams, with role-based access for HR and IT.",
+  "project_type": "web_saas",
+  "detail_level": "medium",
+  "output_format": "phases_table"
 }
 ```
-
-**Response:**
-```json
-{
-  "estimation": "...",
-  "model": "gpt-4o-mini-2024-07-18",
-  "provider": "openai",
-  "tokens_used": 1234,
-  "estimated_cost": 0.0021,
-  "cache_hit": false,
-  "evaluation": {
-    "score": 1.0,
-    "issues": []
-  }
-}
-```
-
-`cache_hit: true` means the response was served straight from Redis without calling the LLM. `provider`/`model` reflect whichever deployment actually answered : the primary model, or the fallback if the primary failed.
-
-### `POST /api/v1/estimate/stream`
-
-Same request body as above. Responds with `text/event-stream`: an `event: token` per chunk of generated text, followed by a final `event: done`, or `event: error` if the call fails after exhausting retries and fallback.
-
-### `POST /api/v2/estimate`
-
-Structured estimation: the request is rendered through a Jinja2 prompt template (see [Prompt Versions](#prompt-versions) below) and the LLM's answer is validated against a Pydantic schema (via [Instructor](https://python.useinstructor.com/)) instead of returned as free text.
-
-**Request body:**
-```json
-{
-  "description": "Internal admin tool to manage support tickets, with role-based access and Slack notifications.",
-  "project_type": "internal_tool",
-  "detail_level": "detailed",
-  "output_format": "phases_table",
-  "reference_projects": null
-}
-```
-`project_type`: `mobile_app` | `web_saas` | `internal_tool` | `data_pipeline`. `detail_level`: `summary` | `medium` | `detailed`. `output_format`: `phases_table` | `line_items` | `narrative`. `reference_projects` is optional : a list of `{name, description, actual_duration_weeks, actual_cost_eur}` past projects used as an extra calibration anchor.
+`project_type`: `mobile_app` | `web_saas` | `internal_tool` | `data_pipeline`. `detail_level`: `summary` | `medium` | `detailed`. `output_format`: `phases_table` | `line_items` | `narrative`.
 
 **Response:**
 ```json
 {
   "result": {
     "summary": "...",
-    "total_duration_weeks": 8,
-    "total_cost_eur": 12500,
-    "confidence_pct": 75,
+    "confidence_pct": 80,
     "phases": [
-      {"name": "Discovery", "duration_weeks": 1, "cost_eur": 625, "confidence_pct": 80, "assumptions": ["..."]}
-    ]
+      {"name": "Discovery", "duration_weeks": 1, "cost_eur": 2500, "summary": "Workshops and scoping."}
+    ],
+    "total_duration_weeks": 9,
+    "total_cost_eur": 24500
   },
-  "prompt_version": "v1"
+  "prompt_version": "v1",
+  "cached": false,
+  "meta": {"model": "gpt-4o-mini", "provider": "openai", "cost_usd": 0.000446, "latency_ms": 2607}
 }
 ```
-Totals are summed from `phases` in Python rather than asked of the LLM, since small models are unreliable at keeping a separately-declared total consistent with the phases across retries. A confidence below 30% must come with `summary` starting in `"Out of scope:"` and `phases: []`, enforced by a Pydantic validator that Instructor retries against.
 
-#### Prompt Versions
+**Errors:**
 
-Prompts live under `app/prompts/estimation/<version>/` (`system.j2`, `user.j2`, `examples.j2`), rendered by `app/prompts/loader.py`. `v1` and `v2` differ deliberately (tone and few-shot examples), and the endpoint picks one via the `?prompt_version=` query param (defaults to `v1`); an unknown version returns `400`. Every render logs a `prompt_rendered` event with the version and a content hash, for tracing which exact prompt a given call used.
+| Status | When |
+|--------|------|
+| `400`  | An input guardrail rejected the request. Body is `{"detail": {"reason": "prompt_injection" \| "pii" \| "moderation", "message": "..."}}` |
+| `422`  | The request body failed schema validation (missing field, bad enum, description too short) |
+| `502`  | The upstream LLM call failed, including Instructor exhausting its retries |
 
-## Testing an Estimation
+An off-topic or unsizeable description is **not** an error: it returns `200` with a `summary` starting in `"Out of scope:"`, `confidence_pct` below 30, and a single `Not estimated` phase. The UI renders that as a warning rather than a fake estimate.
+
+### `POST /api/v1/estimate/text` and `/api/v1/estimate/stream`
+
+**Request body** (both): `{"transcription": "Client meeting summary describing the project..."}` — minimum 50 characters.
+
+`/estimate/text` responds with the Markdown estimation plus usage, cost, `cache_hit`, and an `evaluation` object scoring the output's structure (does it have the breakdown table, do the declared totals match the summed rows, was it cut off). `/estimate/stream` responds with `text/event-stream`: an `event: token` per chunk, then `event: meta` (cache hit, cost, model) and `event: done`, or `event: error` if the call fails after retries and fallback.
+
+### Totals are computed in Python, not by the LLM
+
+The model fills an `EstimationDraft` (summary, confidence, phases) and the service sums the phases to produce `total_duration_weeks` / `total_cost_eur`. This is a measured decision, not a stylistic one: asking `gpt-4o-mini` for a grand total alongside the phases failed every one of Instructor's 7 attempts in a live run (~24k tokens burned, drifting further each retry) before the request 502'd. Field ordering and an explicit "compute the sum" instruction were not enough. `EstimationResult.phases_sum_matches_total` is kept as a genuine invariant assertion over the computed value.
+
+### Prompt versions
+
+Prompts live under `app/prompts/estimation/<version>/` (`system.j2`, `user.j2`, `examples.j2`) and are rendered by `app/prompts/loader.py`. The active version is the `PROMPT_VERSION` setting — a deploy-time decision, not a client-supplied parameter, so rolling out a new prompt is a config change and every response echoes back the version that produced it. Each render logs a `prompt_rendered` event with the version and a content hash (not the text, so descriptions stay out of the logs).
+
+## Testing
 ```bash
-# Blocking
+uv run pytest
+```
+The suite is offline: template rendering, schema validators, guardrail regexes, and the endpoint with the service faked out. No API keys or Redis needed.
+
+```bash
 curl -X POST http://127.0.0.1:8000/api/v1/estimate \
   -H "Content-Type: application/json" \
-  -d '{"transcription": "Client meeting summary describing the project..."}'
-
-# Streaming
-curl -N -X POST http://127.0.0.1:8000/api/v1/estimate/stream \
-  -H "Content-Type: application/json" \
-  -d '{"transcription": "Client meeting summary describing the project..."}'
-
-# Structured (v2)
-curl -X POST http://127.0.0.1:8000/api/v2/estimate \
-  -H "Content-Type: application/json" \
   -d '{
-    "description": "Internal admin tool to manage support tickets, with role-based access and Slack notifications.",
-    "project_type": "internal_tool",
-    "detail_level": "detailed",
+    "description": "A small B2B SaaS to manage employee equipment loans across teams.",
+    "project_type": "web_saas",
+    "detail_level": "medium",
     "output_format": "phases_table"
   }'
 ```

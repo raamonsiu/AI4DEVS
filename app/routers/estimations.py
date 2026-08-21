@@ -1,72 +1,59 @@
-import asyncio
-import json
-from collections.abc import AsyncIterator
+"""POST /api/v1/estimate — typed input, validated structured output.
+
+Error handling mapping:
+
+- ``InputGuardrailViolation`` → HTTP 400 with ``{reason, message}`` so the client
+  can render a clear actionable message (the regex caught a prompt injection or
+  PII, or moderation flagged the content).
+- Anything else from the pipeline → HTTP 502 (the LLM upstream failed, including
+  ``InstructorRetryException`` when the model couldn't satisfy the validators
+  within ``max_retries``).
+"""
+
+from __future__ import annotations
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
-from sse_starlette.sse import EventSourceResponse
 
-from app.dependencies import get_llm_wrapper
-from app.schemas.estimations import EstimationRequest, EstimationResponse, StreamEstimationRequest
-from app.services.guardrails import InputModerationError, validate_input
-from app.services.llm_service import build_system_prompt, generate_estimation
-from app.services.llm_wrapper import LLMWrapper
+from app.dependencies import get_estimation_service
+from app.guardrails.input import InputGuardrailViolation
+from app.schemas.estimation import EstimationRequest, EstimationResponse
+from app.services.estimation import EstimationService
 
 log = structlog.get_logger()
 
 router = APIRouter(prefix="/api/v1", tags=["estimations"])
 
+
 @router.post("/estimate", response_model=EstimationResponse)
-async def estimate(request: EstimationRequest):
+def create_estimation(
+    request: EstimationRequest,
+    service: EstimationService = Depends(get_estimation_service),
+) -> EstimationResponse:
+    """Run the full estimation pipeline and return the structured response."""
+    log.info(
+        "estimation_request_received",
+        project_type=request.project_type.value,
+        detail_level=request.detail_level.value,
+        output_format=request.output_format.value,
+        description_chars=len(request.description),
+    )
+
     try:
-        validate_input(request.transcription)
-    except InputModerationError as exc:
-        log.warning("estimation_v1_input_rejected", error=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    result = generate_estimation(request.transcription)
-    return result
-
-@router.post("/estimate/stream")
-async def estimate_stream(
-    request: StreamEstimationRequest,
-    wrapper: LLMWrapper = Depends(get_llm_wrapper),
-) -> EventSourceResponse:
-    """Stream a software estimation token by token via Server-Sent Events."""
-    try:
-        validate_input(request.transcription)
-    except InputModerationError as exc:
-        log.warning("estimation_v1_stream_input_rejected", error=str(exc))
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    system_prompt = build_system_prompt()
-
-    async def event_generator() -> AsyncIterator[dict]:
-        loop = asyncio.get_running_loop()
-        meta_holder: dict = {}
-        chunks = wrapper.complete_stream(
-            system_prompt=system_prompt,
-            user_message=request.transcription,
-            meta_holder=meta_holder,
+        return service.estimate(request)
+    except InputGuardrailViolation as exc:
+        log.info(
+            "estimation_blocked_by_input_guardrail",
+            reason=exc.reason,
+            message=exc.message,
         )
-
-        def _next_chunk() -> str | None:
-            try:
-                return next(chunks)
-            except StopIteration:
-                return None
-
-        try:
-            while True:
-                chunk = await loop.run_in_executor(None, _next_chunk)
-                if chunk is None:
-                    break
-                if chunk:
-                    yield {"event": "token", "data": chunk}
-            yield {"event": "meta", "data": json.dumps(meta_holder)}
-            yield {"event": "done", "data": "[DONE]"}
-        except Exception as exc:
-            yield {"event": "error", "data": str(exc)}
-
-    return EventSourceResponse(event_generator())
-
+        raise HTTPException(
+            status_code=400, detail={"reason": exc.reason, "message": exc.message}
+        ) from exc
+    except Exception as exc:
+        log.error(
+            "estimation_endpoint_error",
+            error=str(exc)[:400],
+            error_type=type(exc).__name__,
+        )
+        raise HTTPException(status_code=502, detail="Upstream LLM call failed") from exc
